@@ -1,5 +1,6 @@
 #include "kernels.hpp"
 #include "kernels_common.cuh"
+#include "../cpu/cpu_moe.h"
 
 #include <cstdlib>
 
@@ -1454,6 +1455,188 @@ route_select_and_group_kernel(
         for (int i = threadIdx.x; i < NWORDS; i += B_CONST * 32) {
             dst_u[i] = src_u[i];
         }
+    }
+}
+
+// B = 1 decode router in one launch (SQUID_ROUTE_FUSED, default on). The 64 blocks compute the logits exactly as
+// route_logits_nvfp4_parallel_kernel<1>; the last block to finish then runs route_select_and_group_kernel<1>'s top-8
+// (same arithmetic: identical ids and weights) and, on a host visit with the decode expert cache (sh != nullptr),
+// cpu_moe_post_cache_kernel's GPU/CPU split and CPU request. Two launches fewer per host visit and one per VRAM
+// visit, and the CPU gets its request two kernel boundaries earlier. done_ctr: zero before the first launch; the last
+// block resets it (the next launch of this kernel starts its counting only after this grid has completed).
+struct RouteFusedPost {
+    CpuMoeShared* sh;           // nullptr: no CPU request on this visit
+    uint32_t* seq_ctr;
+    const int32_t* cmap_l;
+    int32_t* glist;
+    uint32_t* hist_l;
+    int layer;
+    int pcie_h;
+};
+
+__device__ __forceinline__ void route_st_release_sys_u32(uint32_t* p, uint32_t v) {
+    asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
+}
+
+__global__ void __launch_bounds__(32)
+route_fused_b1_kernel(
+    const __half* __restrict__ m_h,            // [HIDDEN]
+    const uint8_t* __restrict__ w_data,        // [128, HIDDEN/2]
+    const uint8_t* __restrict__ w_scales,      // [128, HIDDEN/16]
+    float gscale,
+    float* __restrict__ logits,                // [128] scratch
+    const float* __restrict__ router_bias,     // [128]
+    int32_t* __restrict__ out_ids,             // [TOP_K]
+    float* __restrict__ out_weights,           // [TOP_K]
+    uint32_t* done_ctr,
+    RouteFusedPost post,
+    uint32_t zero) {
+    // 1. Logits: route_logits_nvfp4_parallel_kernel<1>, unchanged.
+    {
+        int sub_e = threadIdx.x >> 4;
+        int lane = threadIdx.x & 15;
+        int e = blockIdx.x * 2 + sub_e;
+        constexpr int W_STRIDE = HIDDEN >> 1;
+        constexpr int S_STRIDE = HIDDEN >> 4;
+        const uint2* wr = reinterpret_cast<const uint2*>(w_data + (size_t)e * W_STRIDE);
+        const uint8_t* sr = w_scales + (size_t)e * S_STRIDE;
+        uint2 w8[9];
+        uint8_t s8[9];
+        #pragma unroll
+        for (int iter = 0; iter < 9; ++iter) {
+            int blk = lane + iter * 16;
+            w8[iter] = ld_stream_u2(wr + blk);
+            s8[iter] = ld_scale_u8(sr + blk);
+        }
+        pdl_wait_fenced(zero);
+        pdl_trigger();
+        float acc = 0.0f;
+        #pragma unroll
+        for (int iter = 0; iter < 9; ++iter) {
+            int blk = lane + iter * 16;
+            float sc = cvt_e4m3_to_float(s8[iter]);
+            __half2 wh[8];
+            cvt_e2m1x8_to_half2x4(w8[iter].x, wh[0], wh[1], wh[2], wh[3]);
+            cvt_e2m1x8_to_half2x4(w8[iter].y, wh[4], wh[5], wh[6], wh[7]);
+            int koff = blk << 4;
+            uint4 xv0 = ld_dep_u4(m_h + koff);
+            uint4 xv1 = ld_dep_u4(m_h + koff + 8);
+            const __half2* xb0 = reinterpret_cast<const __half2*>(&xv0);
+            const __half2* xb1 = reinterpret_cast<const __half2*>(&xv1);
+            __half2 p0 = __hmul2(wh[0], xb0[0]), p1 = __hmul2(wh[1], xb0[1]);
+            p0 = __hfma2(wh[2], xb0[2], p0); p1 = __hfma2(wh[3], xb0[3], p1);
+            p0 = __hfma2(wh[4], xb1[0], p0); p1 = __hfma2(wh[5], xb1[1], p1);
+            p0 = __hfma2(wh[6], xb1[2], p0); p1 = __hfma2(wh[7], xb1[3], p1);
+            float2 pf = __half22float2(__hadd2(p0, p1));
+            acc = fmaf(pf.x + pf.y, sc, acc);
+        }
+        float val = half_warp_sum(acc) * gscale;
+        if (lane == 0) logits[e] = val;
+    }
+
+    // 2. The last block to finish selects (threadFenceReduction pattern).
+    __threadfence();
+    __syncwarp();
+    uint32_t prev = 0;
+    if (threadIdx.x == 0) prev = atomicAdd(done_ctr, 1u);
+    prev = __shfl_sync(0xffffffffu, prev, 0);
+    if (prev != gridDim.x - 1) return;
+    __threadfence();
+    if (threadIdx.x == 0) *done_ctr = 0u;
+
+    // 3. Top-8: route_select_and_group_kernel<1>, same arithmetic. L1 is bypassed for the other blocks' logits.
+    const int lane = threadIdx.x;
+    float sc[4], bi[4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int e = lane + 32 * i;
+        float raw = fast_sigmoid(__ldcg(logits + e));
+        sc[i] = raw;
+        bi[i] = raw + __ldg(router_bias + e);
+    }
+    int winners[TOP_K];
+    float chosen[TOP_K];
+    for (int k = 0; k < TOP_K; ++k) {
+        float best = -1e30f;
+        int best_e = NUM_EXPERTS;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            int e = lane + 32 * i;
+            if (bi[i] > best || (bi[i] == best && e < best_e)) { best = bi[i]; best_e = e; }
+        }
+        float top = warp_max(best);
+        int cand = (best == top) ? best_e : NUM_EXPERTS;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            cand = min(cand, __shfl_xor_sync(0xffffffffu, cand, off));
+        }
+        float sel = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            if (lane + 32 * i == cand) { sel = sc[i]; bi[i] = -1e30f; }
+        }
+        chosen[k] = warp_sum(sel);   // butterfly: the same value in every lane
+        winners[k] = cand;
+    }
+    float total = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < TOP_K; ++k) total += chosen[k];
+    const float inv = ROUTE_SCALE / (total + 1e-20f);
+    int my_e = 0;
+    float my_w = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < TOP_K; ++k) {
+        if (lane == k) { my_e = winners[k]; my_w = chosen[k] * inv; }
+    }
+    if (lane < TOP_K) {
+        out_ids[lane] = my_e;
+        out_weights[lane] = my_w;
+    }
+
+    // 4. CPU request: cpu_moe_post_cache_kernel, same split and payload.
+    if (post.sh == nullptr) return;
+    constexpr int kHostTag = 1 << 16;  // = MOE_HOST_TAG (kernels_gemv.cu)
+    int c = (lane < TOP_K) ? post.cmap_l[my_e] : -1;
+    uint32_t gmask = __ballot_sync(0xffffffffu, c >= 0) & 0xffu;
+    if (__popc(gmask) <= post.pcie_h && gmask != 0xffu) {
+        const int s0 = __ffs(~gmask & 0xffu) - 1;
+        if (lane == s0) c = kHostTag | my_e;
+        gmask |= 1u << s0;
+    }
+    if (c >= 0) {
+        const int j = __popc(gmask & ((1u << lane) - 1u));
+        post.glist[1 + j] = c;
+        post.glist[9 + j] = lane;
+    }
+    if (lane < TOP_K && post.hist_l) atomicAdd(post.hist_l + my_e, 1u);
+    const uint32_t cpu_mask = ~gmask & 0xffu;
+    if (lane == 0) {
+        post.glist[0] = __popc(gmask);
+        post.glist[17] = __popc(cpu_mask);
+    }
+    if (!cpu_mask) return;
+    CpuMoeShared* sh = post.sh;
+    uint4* xd = reinterpret_cast<uint4*>(sh->x);
+    for (int i = lane; i < HIDDEN / 8; i += 32) xd[i] = ld_dep_u4(m_h + i * 8);
+    if (lane < TOP_K) {
+        sh->ids[lane] = my_e;
+        sh->wts[lane] = my_w;
+    }
+    uint32_t s = 0;
+    if (lane == 0) {
+        sh->layer = static_cast<uint32_t>(post.layer);
+        sh->mode = CPU_MOE_MODE_FULL;
+        sh->slot_begin = 0;
+        sh->k_split = 0;
+        sh->slot_mask = cpu_mask;
+        s = *post.seq_ctr + 1;
+        *post.seq_ctr = s;
+    }
+    __threadfence_system();
+    __syncwarp();
+    if (lane == 0) {
+        __threadfence_system();
+        route_st_release_sys_u32(&sh->req_seq, s);
     }
 }
 
@@ -2994,6 +3177,17 @@ static void dispatch_route_nvfp4(
         m_h, static_cast<const uint8_t*>(r.data), r.scales, r.global_scale, scratch_logits, moe_down_zero, 0u);
     launch_pdl(route_select_and_group_kernel<B_CONST>, dim3(1), B_CONST * 32, stream,
         scratch_logits, router_bias, out_ids, out_weights, groups, 0u);
+}
+
+void launch_route_fused_b1(
+    const __half* m_h, const LinearWeight& r, const float* router_bias,
+    float* scratch_logits, int32_t* out_ids, float* out_weights, uint32_t* done_ctr,
+    void* cpu_sh, uint32_t* seq_ctr, int layer, const int32_t* cmap_l, int32_t* glist, uint32_t* hist_l, int pcie_h,
+    cudaStream_t stream) {
+    RouteFusedPost post{static_cast<CpuMoeShared*>(cpu_sh), seq_ctr, cmap_l, glist, hist_l, layer, pcie_h};
+    launch_pdl(route_fused_b1_kernel, dim3(NUM_EXPERTS / 2), 32, stream,
+        m_h, static_cast<const uint8_t*>(r.data), r.scales, r.global_scale, scratch_logits, router_bias,
+        out_ids, out_weights, done_ctr, post, 0u);
 }
 
 void launch_route_topk_nvfp4(

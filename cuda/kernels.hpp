@@ -262,6 +262,14 @@ void launch_relative_attention_gated(
     int B, const int32_t* d_pos,
     cudaStream_t stream);
 
+// B = 1 decode router in one launch: logits, top-8 and (cpu_sh != nullptr) the decode-cache GPU/CPU split and CPU
+// request of cpu_moe_post_cache_kernel. Bit-identical to launch_route_topk_nvfp4 + that kernel.
+void launch_route_fused_b1(
+    const __half* m_h, const LinearWeight& router_nvfp4, const float* router_bias,
+    float* scratch_logits, int32_t* out_ids, float* out_weights, uint32_t* done_ctr,
+    void* cpu_sh, uint32_t* seq_ctr, int layer, const int32_t* cmap_l, int32_t* glist, uint32_t* hist_l, int pcie_h,
+    cudaStream_t stream);
+
 // 64-block parallel half-warp NVFP4 MoE Router + Fused Top-8 & ExpertGroups + Free moe_down zeroing!
 void launch_route_topk_nvfp4(
     const __half* m_h,            // [B, HIDDEN]

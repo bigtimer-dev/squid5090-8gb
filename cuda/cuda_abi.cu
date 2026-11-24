@@ -723,6 +723,16 @@ void squid_launch_route_topk_nvfp4(
         scratch_logits, out_ids, out_weights, static_cast<ExpertGroups*>(groups), nullptr, B, static_cast<cudaStream_t>(stream));
 }
 
+void squid_launch_route_fused_b1(
+    const void* m_h, const CLinearWeight* router_nvfp4, const float* router_bias,
+    float* scratch_logits, int32_t* out_ids, float* out_weights, uint32_t* done_ctr,
+    void* cpu_sh, uint32_t* seq_ctr, int32_t layer, const int32_t* cmap_l, int32_t* glist, uint32_t* hist_l,
+    int32_t pcie_h, void* stream) {
+    launch_route_fused_b1(
+        static_cast<const __half*>(m_h), to_lw(*router_nvfp4), router_bias, scratch_logits, out_ids, out_weights,
+        done_ctr, cpu_sh, seq_ctr, layer, cmap_l, glist, hist_l, pcie_h, static_cast<cudaStream_t>(stream));
+}
+
 void squid_launch_route_topk(
     const float* m, const void* router_w, const float* router_bias,
     float* scratch_logits, int32_t* out_ids, float* out_weights, void* groups, int32_t B, void* stream) {

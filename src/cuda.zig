@@ -361,6 +361,23 @@ pub extern "c" fn squid_launch_mega_attn_post_mlp_in(
     stream: ?*anyopaque,
 ) void;
 
+pub extern "c" fn squid_launch_route_fused_b1(
+    m_h: *const anyopaque,
+    router_nvfp4: *const CLinearWeight,
+    router_bias: [*]const f32,
+    scratch_logits: [*]f32,
+    out_ids: [*]i32,
+    out_weights: [*]f32,
+    done_ctr: [*]u32,
+    cpu_sh: ?*anyopaque,
+    seq_ctr: ?[*]u32,
+    layer: i32,
+    cmap_l: ?[*]const i32,
+    glist: ?[*]i32,
+    hist_l: ?[*]u32,
+    pcie_h: i32,
+    stream: ?*anyopaque,
+) void;
 pub extern "c" fn squid_launch_route_topk_nvfp4(
     m_h: *const anyopaque,
     router_nvfp4: *const CLinearWeight,

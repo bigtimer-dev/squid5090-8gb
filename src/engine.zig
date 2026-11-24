@@ -353,6 +353,8 @@ pub const Engine = struct {
     ctrl_d: [*]f32 = undefined,
     router_logits: [*]f32 = undefined,
     route_ids: [*]i32 = undefined,
+    route_ctr: ?[*]u32 = null, // device [16]: last-block counter of the fused B = 1 router (SQUID_ROUTE_FUSED)
+    route_fused: bool = false,
     route_w: [*]f32 = undefined,
     exp_groups: *anyopaque = undefined,
     moe_act_h: *anyopaque = undefined,
@@ -532,6 +534,12 @@ pub const Engine = struct {
         self.router_logits = self.arena.alloc_many(f32, b_max * constants.expert_count);
         self.route_ids = self.arena.alloc_many(i32, b_max * constants.top_k_experts);
         self.route_w = self.arena.alloc_many(f32, b_max * constants.top_k_experts);
+        self.route_ctr = self.arena.alloc_many(u32, 16);
+        {
+            const zeros: [16]u32 = @splat(0);
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(@ptrCast(self.route_ctr.?), @ptrCast(&zeros), @sizeOf(@TypeOf(zeros))));
+        }
+        self.route_fused = if (tiger.getenv("SQUID_ROUTE_FUSED")) |v| v[0] != '0' else true;
         self.exp_groups = self.arena.alloc_raw(expert_groups_bytes);
         self.moe_act_h = self.arena.alloc_raw(b_max * constants.top_k_experts * constants.intermediate_dim * 2);
         self.moe_down = self.arena.alloc_many(f32, b_max * constants.hidden_dim);
@@ -3403,7 +3411,32 @@ pub const Engine = struct {
                 }
             }
 
-            if (w.mode == .nvfp4) {
+            const use_dbank: bool = batch_size == 1 and self.dbank_use and @as(i32, @intCast(l)) == self.dbank_layer;
+            const cpu_visit: bool = batch_size == 1 and (self.cpu_moe_layers >> @intCast(l)) & 1 == 1 and !use_dbank;
+            const use_dcache: bool = cpu_visit and self.dbank_use and (self.dcache_layers >> @intCast(l)) & 1 == 1;
+            // B = 1: one launch computes the logits, picks the top 8 and, on a decode-cache host visit, posts the CPU's
+            // request (bit-identical to the three launches it replaces).
+            const fused_route: bool = w.mode == .nvfp4 and batch_size == 1 and self.route_fused;
+            const fused_post: bool = fused_route and use_dcache;
+            if (fused_route) {
+                cuda.squid_launch_route_fused_b1(
+                    self.mlp_normed_h,
+                    &lw.router_nvfp4,
+                    lw.router_bias.?,
+                    self.router_logits,
+                    self.route_ids,
+                    self.route_w,
+                    self.route_ctr.?,
+                    if (fused_post) self.cpu_moe_sh_dev.? else null,
+                    if (fused_post) self.cpu_moe_ctr.? else null,
+                    @intCast(l),
+                    if (fused_post) self.dcache_cmap.? + @as(usize, l) * constants.expert_count else null,
+                    if (fused_post) self.dcache_glist.? else null,
+                    if (fused_post) (if (self.dcache_hist) |h| h + @as(usize, l) * constants.expert_count else null) else null,
+                    self.dcache_pcie_h,
+                    self.stream,
+                );
+            } else if (w.mode == .nvfp4) {
                 cuda.squid_launch_route_topk_nvfp4(
                     self.mlp_normed_h,
                     &lw.router_nvfp4,
@@ -3431,12 +3464,9 @@ pub const Engine = struct {
             if (batch_size == 1 and self.trace_dev != null) {
                 cuda.squid_launch_route_trace(self.route_ids, self.trace_dev.?, self.trace_ctr.?, @intCast(vi), constants.visit_count, trace_tokens_max, if (vi == constants.visit_count - 1) 1 else 0, self.stream);
             }
-            const use_dbank: bool = batch_size == 1 and self.dbank_use and @as(i32, @intCast(l)) == self.dbank_layer;
-            const cpu_visit: bool = batch_size == 1 and (self.cpu_moe_layers >> @intCast(l)) & 1 == 1 and !use_dbank;
-            const use_dcache: bool = cpu_visit and self.dbank_use and (self.dcache_layers >> @intCast(l)) & 1 == 1;
             if (use_dcache) {
                 const gl = self.dcache_glist.?;
-                cuda.squid_launch_cpu_moe_post_cache(self.mlp_normed_h, self.route_ids, self.route_w, self.cpu_moe_sh_dev.?, self.cpu_moe_ctr.?, @intCast(l), self.dcache_cmap.? + @as(usize, l) * constants.expert_count, gl, if (self.dcache_hist) |h| h + @as(usize, l) * constants.expert_count else null, self.dcache_pcie_h, self.stream);
+                if (!fused_post) cuda.squid_launch_cpu_moe_post_cache(self.mlp_normed_h, self.route_ids, self.route_w, self.cpu_moe_sh_dev.?, self.cpu_moe_ctr.?, @intCast(l), self.dcache_cmap.? + @as(usize, l) * constants.expert_count, gl, if (self.dcache_hist) |h| h + @as(usize, l) * constants.expert_count else null, self.dcache_pcie_h, self.stream);
                 cuda.squid_launch_moe_slots_list_h(&self.dcache_w13, &self.dcache_w2, &self.dcache_w13b, &self.dcache_w2b, &lw.w13, &lw.w2, self.mlp_normed_h, self.route_w, self.moe_act_h, self.moe_down, gl, self.stream);
                 if (self.cpu_moe_l2pf > 0 and vi + 1 < constants.visit_count) self.launch_l2_prefetch_layer(&w.layers[self.schedule[vi + 1].physical_layer], gl + 17);
                 cuda.squid_launch_cpu_moe_wait_add_if(self.cpu_moe_sh_dev.?, self.cpu_moe_ctr.?, self.moe_down, @ptrCast(self.cpu_moe_ctr.? + 1), gl + 17, self.stream);
@@ -3771,6 +3801,7 @@ fn compute_runtime_vram_bytes(
     total += tiger.align_up_u64(3 * b * constants.gate_rank * 4, a); // ctrl_d
     total += tiger.align_up_u64(b * constants.expert_count * 4, a); // router_logits
     total += 2 * tiger.align_up_u64(b * constants.top_k_experts * 4, a); // route_ids, route_w
+    total += tiger.align_up_u64(16 * 4, a); // route_ctr
     total += tiger.align_up_u64(expert_groups_bytes, a);
     total += tiger.align_up_u64(b * constants.top_k_experts * constants.intermediate_dim * 2, a); // moe_act_h
     total += tiger.align_up_u64(b * constants.hidden_dim * 4, a); // moe_down
