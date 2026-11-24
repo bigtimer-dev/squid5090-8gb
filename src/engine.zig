@@ -117,6 +117,8 @@ const PromptLookupIndex = struct {
 
 const prefix_checkpoint_count: usize = 4;
 const side_shield_max_tokens: u32 = 4096;
+/// A side request is shielded only if its prompt leaves at least this much room for the reply inside the shield.
+const side_min_reply_tokens: u32 = 512;
 const prefill_batch_max: u32 = 2048;
 const prefill_local_attn_sub: u32 = 256;
 const prefill_sub_chunks_max: u32 = prefill_batch_max / constants.mtp_block_size_max; // 256
@@ -847,9 +849,13 @@ pub const Engine = struct {
             while (common < max_match and self.prefix_cache.session_tokens[common] == prompt[common]) : (common += 1) {}
 
             // Short non-matching side request while holding a long session? Shield global KV prefix!
+            // Fork: shield whenever the side *prompt* fits. Clients such as OpenCode send title requests with a large
+            // max_tokens (the model's output limit) that stop after ~100 tokens; the defer below drops the session only
+            // if the reply really ran past the shielded prefix.
             const side_need: u32 = prompt_len + max_new_tokens + 16;
-            if (self.prefix_cache.session_len >= 1024 and common < 512 and side_need <= side_shield_max_tokens) {
-                shield_tokens = @min(self.prefix_cache.session_len, side_need);
+            const side_prompt_fits: bool = prompt_len + side_min_reply_tokens + 16 <= side_shield_max_tokens;
+            if (self.prefix_cache.session_len >= 1024 and common < 512 and side_prompt_fits) {
+                shield_tokens = @min(self.prefix_cache.session_len, @min(side_need, side_shield_max_tokens));
                 self.copy_global_kv_shield(shield_tokens, true);
                 self.reset();
             } else if (common > 0 and use_mtp == self.prefix_cache.session_use_mtp) {
@@ -893,7 +899,14 @@ pub const Engine = struct {
             self.reset();
         }
         defer if (shield_tokens > 0) {
-            self.copy_global_kv_shield(shield_tokens, false);
+            const side_end: u32 = @as(u32, @intCast(self.current_position)) + 16 + constants.mtp_block_size_max;
+            if (self.prefix_cache.session_len > shield_tokens and side_end > shield_tokens) {
+                // The side reply overwrote session KV beyond the shield: the cached session is no longer valid.
+                self.prefix_cache.session_len = 0;
+                for (&self.prefix_cache.checkpoints) |*ckpt| ckpt.valid = false;
+            } else {
+                self.copy_global_kv_shield(shield_tokens, false);
+            }
             self.prefix_cache.gpu_live_at_pos = -1;
         };
 
