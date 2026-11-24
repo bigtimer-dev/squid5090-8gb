@@ -1,6 +1,8 @@
 #include "kernels.hpp"
 #include "kernels_common.cuh"
 
+#include <cstdlib>
+
 #include <cstdio>
 
 namespace squid {
@@ -1354,6 +1356,9 @@ __global__ void build_expert_groups_kernel(
 
 constexpr int MOE_TILE = 16;
 constexpr int MOE_MAXM = 8;
+constexpr int MOE_HOST_TAG = 1 << 16;   // decode expert cache list: entry = MOE_HOST_TAG | e -> expert e of the host bank
+constexpr int MOE_BANK2_TAG = 1 << 17;  // MOE_BANK2_TAG | c -> slot c of the second (persistent) cache bank (wb, wsb, wfb)
+constexpr int MOE_IDX_MASK = MOE_HOST_TAG - 1;
 constexpr int MOE_UP_WARPS = HIDDEN / 128;         // 18 warps (576 threads)
 constexpr int MOE_DOWN_GROUPS = INTERMEDIATE / 128; // 9 column groups
 constexpr int MOE_DOWN_PAR = 2;                     // 2 experts per round
@@ -1514,6 +1519,135 @@ moe_up_tc_kernel(
     }
 }
 
+// Persistent B = 1 variant of moe_up_tc_kernel (SQUID_MOE_UP_PERSIST=1). The one-shot kernel runs 1152 blocks of
+// 576 threads, 2 per SM, and each block loads its 20.7 KB tile, then sits through the MMAs, the 18-warp reduction
+// and the activation with nothing in flight (~170 GB/s). Here 2 blocks per SM walk the (slot, tile) items and issue
+// the next item's weight loads before working on the current one. Per item the arithmetic is the one-shot kernel's
+// (same warp/lane split, same MMAs, same reduction order), so results are bit-identical.
+template <int FMT>
+__global__ void __launch_bounds__(MOE_UP_WARPS * 32)
+moe_up_tc_persist_kernel(
+    const __half* __restrict__ x_h,
+    const int32_t* __restrict__ idx,
+    const uint8_t* __restrict__ w,
+    const uint8_t* __restrict__ ws,
+    const float* __restrict__ wfactor,
+    int nslots,
+    __half* __restrict__ out_act_h,
+    int extra_tiles,  // > 0: also tiles [0, extra_tiles) of slot nslots (GPU part of a K-split slot)
+    const int32_t* __restrict__ glist,  // != null: decode expert cache list (see cpu_moe_post_cache_kernel):
+                                        // glist[0] = n, glist[1 + j] = expert index in w for compact slot j < n, or
+                                        // MOE_HOST_TAG | e: expert e of the host bank (wh, wsh, wfh; over PCIe);
+                                        // activations go to compact slots 0..n-1; idx, nslots are ignored
+    const uint8_t* __restrict__ wh,
+    const uint8_t* __restrict__ wsh,
+    const float* __restrict__ wfh,
+    const uint8_t* __restrict__ wb,
+    const uint8_t* __restrict__ wsb,
+    const float* __restrict__ wfb) {
+    constexpr int K = HIDDEN;
+    constexpr int R = 2 * INTERMEDIATE;
+    constexpr int CB = (FMT == 0) ? (K >> 1) : K;
+    constexpr int SB = (FMT == 0) ? (K >> 4) : (K >> 5);
+    constexpr int TILES = R / MOE_TILE;
+    __shared__ float red[MOE_UP_WARPS][32][4];
+    __shared__ float tile_out[MOE_TILE][MOE_MAXM + 1];
+
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int g = lane >> 2;
+    const int t = lane & 3;
+
+    pdl_wait();
+    pdl_trigger();
+
+    if (glist) {
+        nslots = ld_dep_i32(glist);
+        idx = glist + 1;
+        extra_tiles = 0;
+    }
+    const int lo = (lane < nslots + (extra_tiles > 0 ? 1 : 0)) ? ld_dep_i32(idx + lane) : -1;
+    const int total = TILES * nslots + extra_tiles;
+
+    auto prep = [&](int it, MoeFrag<FMT>& f, int& e_out, uint32_t& mask_out) {
+        const int tile = it % TILES;
+        const int slot = it / TILES;
+        const int e = __shfl_sync(0xffffffffu, lo, slot);
+        const uint32_t mask = __ballot_sync(0xffffffffu, lo == e);
+        e_out = e;
+        mask_out = (__ffs(mask) - 1 == slot) ? mask : 0u;  // 0: a repeated expert, done by its first slot
+        const bool hst = (e & MOE_HOST_TAG) != 0, b2 = (e & MOE_BANK2_TAG) != 0;
+        const size_t row = (size_t)(e & MOE_IDX_MASK) * R + tile * MOE_TILE + g;
+        moe_load_w<FMT, K>(f, (hst ? wh : b2 ? wb : w) + row * CB, (hst ? wsh : b2 ? wsb : ws) + row * SB, 4 * warp + t);
+        moe_load_x<FMT>(f, (g == 0) ? x_h : nullptr, 4 * warp + t);
+    };
+
+    int item = blockIdx.x;
+    MoeFrag<FMT> nxt;
+    int e_n = 0;
+    uint32_t mask_n = 0u;
+    if (item < total) prep(item, nxt, e_n, mask_n);
+    #pragma unroll 1
+    while (item < total) {
+        const MoeFrag<FMT> cur = nxt;
+        const int e = e_n;
+        const uint32_t mask = mask_n;
+        const int tile = item % TILES;
+        const int next = item + gridDim.x;
+        if (next < total) prep(next, nxt, e_n, mask_n);
+        item = next;
+        if (!mask) continue;
+
+        float d[4] = {0.f, 0.f, 0.f, 0.f};
+        moe_mma_frag<FMT>(cur, d);
+        #pragma unroll
+        for (int v = 0; v < 4; ++v) red[warp][lane][v] = d[v];
+        __syncthreads();
+
+        if (threadIdx.x < 32) {
+            float s[4] = {0.f, 0.f, 0.f, 0.f};
+            #pragma unroll
+            for (int ww = 0; ww < MOE_UP_WARPS; ++ww) {
+                #pragma unroll
+                for (int v = 0; v < 4; ++v) s[v] += red[ww][lane][v];
+            }
+            float es = (FMT == 0) ? ((e & MOE_HOST_TAG) ? wfh : (e & MOE_BANK2_TAG) ? wfb : wfactor)[e & MOE_IDX_MASK] : 1.0f;
+            tile_out[g][2 * t]         = s[0] * es;
+            tile_out[g][2 * t + 1]     = s[1] * es;
+            tile_out[g + 8][2 * t]     = s[2] * es;
+            tile_out[g + 8][2 * t + 1] = s[3] * es;
+        }
+        __syncthreads();
+
+        if (threadIdx.x < MOE_TILE / 2) {  // n = 0 only (M = 1)
+            const int p = threadIdx.x;
+            uint32_t kmask = mask & 0xffu;
+            const float gate = tile_out[2 * p][0];
+            const float up   = tile_out[2 * p + 1][0];
+            const float g_cap = fast_tanh(gate * (1.0f / GATE_SOFTCAP)) * GATE_SOFTCAP;
+            const float u_cap = fast_tanh(up * (1.0f / UP_SOFTCAP)) * UP_SOFTCAP;
+            const __half ah = __float2half((g_cap * fast_sigmoid(gate)) * u_cap);
+            while (kmask) {
+                const int k = __ffs(kmask) - 1;
+                kmask &= kmask - 1;
+                out_act_h[(size_t)k * INTERMEDIATE + tile * (MOE_TILE / 2) + p] = ah;
+            }
+        }
+    }
+}
+
+static int moe_up_persist_grid(bool force = false) {
+    static int full = [] {
+        int dev = 0, sms = 0, per_sm = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, moe_up_tc_persist_kernel<0>, MOE_UP_WARPS * 32, 0);
+        return sms * (per_sm > 0 ? per_sm : 1);
+    }();
+    static const bool on = [] { const char* v = getenv("SQUID_MOE_UP_PERSIST"); return v && v[0] != '0'; }();
+    return (on || force) ? full : 0;
+}
+
 template <int FMT>
 __global__ void __launch_bounds__(MOE_DOWN_WARPS * 32)
 moe_down_tc_kernel(
@@ -1524,7 +1658,8 @@ moe_down_tc_kernel(
     const uint8_t* __restrict__ ws,
     const float* __restrict__ wfactor,
     int M,
-    float* __restrict__ out_down) {
+    float* __restrict__ out_down,
+    int kslots) {  // < TOP_K (M == 1 only): sum only slots [0, kslots) (GPU part of a GPU + CPU split)
     constexpr int K = INTERMEDIATE;
     constexpr int R = HIDDEN;
     constexpr int CB = (FMT == 0) ? (K >> 1) : K;
@@ -1541,7 +1676,7 @@ moe_down_tc_kernel(
     const int g = lane >> 2;
     const int t = lane & 3;
     const int tile = blockIdx.x;
-    const int nslots = M * TOP_K;
+    const int nslots = (kslots < TOP_K) ? kslots : M * TOP_K;
 
     // idx was completed by router before moe_up passed its wait and triggered us!
     if (warp == 0) {
@@ -1621,11 +1756,174 @@ moe_down_tc_kernel(
         float s = 0.f;
         #pragma unroll
         for (int k = 0; k < TOP_K; ++k) {
+            if (k >= kslots) break;
             const int sl = n * TOP_K + k;
             s = fmaf(ld_dep_f32(wts + sl), ybuf[slot_u[sl]][r][n], s);
         }
         out_down[(size_t)n * HIDDEN + tile * MOE_TILE + r] = s;
     }
+}
+
+// Persistent B = 1 variant of moe_down_tc_kernel (SQUID_MOE_DOWN_PERSIST=1): 2 blocks per SM walk the 144 row
+// tiles; the last round of a tile issues the next tile's first-round loads, so there is no gap between the one-shot
+// kernel's 3 waves. Per tile the arithmetic is the one-shot kernel's (same fragments, reduction order, slot fma chain).
+template <int FMT>
+__global__ void __launch_bounds__(MOE_DOWN_WARPS * 32)
+moe_down_tc_persist_kernel(
+    const __half* __restrict__ act_h,
+    const int32_t* __restrict__ idx,
+    const float* __restrict__ wts,
+    const uint8_t* __restrict__ w,
+    const uint8_t* __restrict__ ws,
+    const float* __restrict__ wfactor,
+    float* __restrict__ out_down,
+    int kslots,
+    int ksplit,  // > 0: slot kslots - 1 only over intermediate columns [0, ksplit) (GPU part of a K-split slot)
+    const int32_t* __restrict__ glist,  // != null: decode expert cache list (as moe_up_tc_persist_kernel); compact
+                                        // slot j has routing weight wts[glist[9 + j]]; idx, kslots, ksplit ignored
+    const uint8_t* __restrict__ wh,
+    const uint8_t* __restrict__ wsh,
+    const float* __restrict__ wfh,
+    const uint8_t* __restrict__ wb,
+    const uint8_t* __restrict__ wsb,
+    const float* __restrict__ wfb) {
+    constexpr int K = INTERMEDIATE;
+    constexpr int R = HIDDEN;
+    constexpr int CB = (FMT == 0) ? (K >> 1) : K;
+    constexpr int SB = (FMT == 0) ? (K >> 4) : (K >> 5);
+    constexpr int TILES = R / MOE_TILE;
+    constexpr int M = 1;
+    __shared__ float part[MOE_DOWN_WARPS][32][4];
+    __shared__ float ybuf[TOP_K][MOE_TILE][MOE_MAXM];
+    __shared__ int uexp[TOP_K];
+    __shared__ unsigned long long umask[TOP_K];
+    __shared__ uint8_t slot_u[TOP_K * MOE_MAXM];
+    __shared__ int nuniq;
+
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int g = lane >> 2;
+    const int t = lane & 3;
+    if (glist) {  // written by a kernel that completed before the preceding one started (see the up kernel)
+        kslots = ld_dep_i32(glist);
+        idx = glist + 1;
+        ksplit = 0;
+    }
+    const int nslots = (kslots < TOP_K) ? kslots : M * TOP_K;
+
+    if (warp == 0) {
+        const int lo = (lane < nslots) ? ld_dep_i32(idx + lane) : -1;
+        const int hi = -1;
+        uint64_t remaining = (1ull << nslots) - 1;
+        int u = 0;
+        for (; remaining; ++u) {
+            const int s = __ffsll(static_cast<long long>(remaining)) - 1;
+            const int e = __shfl_sync(0xffffffffu, s < 32 ? lo : hi, s & 31);
+            const uint64_t mask = moe_slot_mask(e, lo, hi);
+            remaining &= ~mask;
+            if (lane == 0) { uexp[u] = e; umask[u] = mask; }
+            if ((mask >> lane) & 1) slot_u[lane] = uint8_t(u);
+        }
+        if (lane == 0) nuniq = u;
+    }
+    __syncthreads();
+
+    const int U = nuniq;
+    const int p = warp / MOE_DOWN_GROUPS;
+    const int c = 4 * (warp % MOE_DOWN_GROUPS) + t;
+    // the K-split slot's unique expert: this warp's 128 columns past ksplit are the CPU's (no load, d = 0)
+    const int u_part = (ksplit > 0) ? slot_u[kslots - 1] : -1;
+    const bool cols_cpu = 128 * (warp % MOE_DOWN_GROUPS) >= ksplit;
+    auto skip = [&](int u) { return u == u_part && cols_cpu; };
+
+    auto xrow = [&](int u) -> const __half* {
+        const uint32_t kmask = (g < M) ? (uint32_t(umask[u] >> (8 * g)) & 0xffu) : 0u;
+        return kmask ? (act_h + ((size_t)g * TOP_K + (__ffs(kmask) - 1)) * K) : nullptr;
+    };
+    auto load_w_tu = [&](int tl, int u, MoeFrag<FMT>& f) {
+        if (skip(u)) return;
+        const int e = uexp[u];
+        const bool hst = (e & MOE_HOST_TAG) != 0, b2 = (e & MOE_BANK2_TAG) != 0;
+        const size_t row = (size_t)(e & MOE_IDX_MASK) * R + tl * MOE_TILE + g;
+        moe_load_w<FMT, K>(f, (hst ? wh : b2 ? wb : w) + row * CB, (hst ? wsh : b2 ? wsb : ws) + row * SB, c);
+    };
+    auto load_x_u = [&](int u, MoeFrag<FMT>& f) {
+        if (!skip(u)) moe_load_x<FMT>(f, xrow(u), c);
+    };
+
+    int tile = blockIdx.x;
+    MoeFrag<FMT> nxt;
+    if (tile < TILES && p < U) load_w_tu(tile, p, nxt);
+    pdl_wait();
+    if (tile < TILES && p < U) load_x_u(p, nxt);
+
+    #pragma unroll 1
+    while (tile < TILES) {
+        const int next_tile = tile + gridDim.x;
+        #pragma unroll 1
+        for (int base = 0; base < U; base += MOE_DOWN_PAR) {
+            const MoeFrag<FMT> cur = nxt;
+            const int u = base + p;
+            if (u + MOE_DOWN_PAR < U) {
+                load_w_tu(tile, u + MOE_DOWN_PAR, nxt);
+                load_x_u(u + MOE_DOWN_PAR, nxt);
+            } else if (u < U && next_tile < TILES) {  // this warp group's last round: next tile's first round
+                load_w_tu(next_tile, p, nxt);
+                load_x_u(p, nxt);
+            }
+            float d[4] = {0.f, 0.f, 0.f, 0.f};
+            if (u < U && !skip(u)) moe_mma_frag<FMT>(cur, d);
+            #pragma unroll
+            for (int v = 0; v < 4; ++v) part[warp][lane][v] = d[v];
+            __syncthreads();
+
+            if (threadIdx.x < MOE_DOWN_PAR * 32 && base + (threadIdx.x >> 5) < U) {
+                const int pp = threadIdx.x >> 5;
+                float sacc[4] = {0.f, 0.f, 0.f, 0.f};
+                #pragma unroll
+                for (int j = 0; j < MOE_DOWN_GROUPS; ++j) {
+                    #pragma unroll
+                    for (int v = 0; v < 4; ++v) sacc[v] += part[pp * MOE_DOWN_GROUPS + j][lane][v];
+                }
+                const int ue = uexp[base + pp];
+                const float es = (FMT == 0) ? ((ue & MOE_HOST_TAG) ? wfh : (ue & MOE_BANK2_TAG) ? wfb : wfactor)[ue & MOE_IDX_MASK] : 1.0f;
+                float (&y)[MOE_TILE][MOE_MAXM] = ybuf[base + pp];
+                y[g][2 * t]         = sacc[0] * es;
+                y[g][2 * t + 1]     = sacc[1] * es;
+                y[g + 8][2 * t]     = sacc[2] * es;
+                y[g + 8][2 * t + 1] = sacc[3] * es;
+            }
+            __syncthreads();
+        }
+        if (next_tile >= TILES) pdl_trigger();
+
+        if (threadIdx.x < MOE_TILE * M) {
+            const int r = threadIdx.x & (MOE_TILE - 1);
+            const int n = threadIdx.x / MOE_TILE;
+            float sum = 0.f;
+            #pragma unroll
+            for (int k = 0; k < TOP_K; ++k) {
+                if (k >= kslots) break;
+                const int sl = n * TOP_K + k;
+                const float wk = glist ? ld_dep_f32(wts + ld_dep_i32(glist + 9 + k)) : ld_dep_f32(wts + sl);
+                sum = fmaf(wk, ybuf[slot_u[sl]][r][n], sum);
+            }
+            out_down[(size_t)n * HIDDEN + tile * MOE_TILE + r] = sum;
+        }
+        tile = next_tile;
+    }
+}
+
+static int moe_down_persist_grid(bool force = false) {
+    static int full = [] {
+        int dev = 0, sms = 0, per_sm = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, moe_down_tc_persist_kernel<0>, MOE_DOWN_WARPS * 32, 0);
+        return sms * (per_sm > 0 ? per_sm : 1);
+    }();
+    static const bool on = [] { const char* v = getenv("SQUID_MOE_DOWN_PERSIST"); return v && v[0] != '0'; }();
+    return (on || force) ? full : 0;
 }
 
 } // namespace
@@ -1776,7 +2074,11 @@ void launch_moe_gate_up_h(
     const ExpertBank& w13, const __half* x_h, const int32_t* route_ids,
     const ExpertGroups* /*groups*/, __half* out_act_h, int B, cudaStream_t stream) {
     dim3 grid((2 * INTERMEDIATE) / MOE_TILE, B * TOP_K);
-    if (w13.is_nvfp4) {
+    if (B == 1 && w13.is_nvfp4 && moe_up_persist_grid() > 0) {
+        launch_pdl(moe_up_tc_persist_kernel<0>, dim3(moe_up_persist_grid()), MOE_UP_WARPS * 32, stream,
+            x_h, route_ids, w13.data, w13.scales, w13.expert_scale, TOP_K, out_act_h, 0, static_cast<const int32_t*>(nullptr),
+            static_cast<const uint8_t*>(nullptr), static_cast<const uint8_t*>(nullptr), static_cast<const float*>(nullptr), static_cast<const uint8_t*>(nullptr), static_cast<const uint8_t*>(nullptr), static_cast<const float*>(nullptr));
+    } else if (w13.is_nvfp4) {
         launch_pdl(moe_up_tc_kernel<0>, grid, MOE_UP_WARPS * 32, stream,
             x_h, route_ids, w13.data, w13.scales, w13.expert_scale, B, out_act_h);
     } else {
@@ -1785,16 +2087,63 @@ void launch_moe_gate_up_h(
     }
 }
 
+// GPU part of a GPU + CPU split visit (B = 1): experts of top-k slots [0, kslots) only.
+void launch_moe_slots_h(
+    const ExpertBank& w13, const ExpertBank& w2, const __half* x_h, const int32_t* route_ids, const float* route_w,
+    __half* act_h, float* out_down, int kslots, int k_split, cudaStream_t stream) {
+    dim3 grid_up((2 * INTERMEDIATE) / MOE_TILE, kslots);
+    dim3 grid_down(HIDDEN / MOE_TILE);
+    const bool ks = k_split > 0 && k_split < INTERMEDIATE && k_split % 128 == 0 && kslots < TOP_K;
+    if (w13.is_nvfp4 && w2.is_nvfp4) {
+        if (moe_up_persist_grid(ks) > 0) {
+            launch_pdl(moe_up_tc_persist_kernel<0>, dim3(moe_up_persist_grid(ks)), MOE_UP_WARPS * 32, stream,
+                x_h, route_ids, w13.data, w13.scales, w13.expert_scale, kslots, act_h, ks ? k_split / 8 : 0,
+                static_cast<const int32_t*>(nullptr), static_cast<const uint8_t*>(nullptr), static_cast<const uint8_t*>(nullptr), static_cast<const float*>(nullptr), static_cast<const uint8_t*>(nullptr), static_cast<const uint8_t*>(nullptr), static_cast<const float*>(nullptr));
+        } else {
+            launch_pdl(moe_up_tc_kernel<0>, grid_up, MOE_UP_WARPS * 32, stream,
+                x_h, route_ids, w13.data, w13.scales, w13.expert_scale, 1, act_h);
+        }
+        if (moe_down_persist_grid(ks) > 0) {
+            launch_pdl(moe_down_tc_persist_kernel<0>, dim3(moe_down_persist_grid(ks)), MOE_DOWN_WARPS * 32, stream,
+                static_cast<const __half*>(act_h), route_ids, route_w, w2.data, w2.scales, w2.expert_scale, out_down,
+                ks ? kslots + 1 : kslots, ks ? k_split : 0, static_cast<const int32_t*>(nullptr), static_cast<const uint8_t*>(nullptr), static_cast<const uint8_t*>(nullptr), static_cast<const float*>(nullptr), static_cast<const uint8_t*>(nullptr), static_cast<const uint8_t*>(nullptr), static_cast<const float*>(nullptr));
+        } else {
+            launch_pdl(moe_down_tc_kernel<0>, grid_down, MOE_DOWN_WARPS * 32, stream,
+                static_cast<const __half*>(act_h), route_ids, route_w, w2.data, w2.scales, w2.expert_scale, 1, out_down, kslots);
+        }
+    }
+}
+
+// Decode expert cache (B = 1): the cached slots of a CPU-served visit, from the VRAM cache banks w13 / w2 (expert
+// index = cache slot), as listed by cpu_moe_post_cache_kernel in glist. Writes out_down (zeros if none are cached).
+void launch_moe_slots_list_h(
+    const ExpertBank& w13, const ExpertBank& w2, const ExpertBank& w13b, const ExpertBank& w2b, const ExpertBank& w13h,
+    const ExpertBank& w2h, const __half* x_h, const float* route_w, __half* act_h, float* out_down, const int32_t* glist,
+    cudaStream_t stream) {
+    launch_pdl(moe_up_tc_persist_kernel<0>, dim3(moe_up_persist_grid(true)), MOE_UP_WARPS * 32, stream,
+        x_h, glist + 1, w13.data, w13.scales, w13.expert_scale, 0, act_h, 0, glist,
+        static_cast<const uint8_t*>(w13h.data), static_cast<const uint8_t*>(w13h.scales), static_cast<const float*>(w13h.expert_scale),
+        static_cast<const uint8_t*>(w13b.data), static_cast<const uint8_t*>(w13b.scales), static_cast<const float*>(w13b.expert_scale));
+    launch_pdl(moe_down_tc_persist_kernel<0>, dim3(moe_down_persist_grid(true)), MOE_DOWN_WARPS * 32, stream,
+        static_cast<const __half*>(act_h), glist + 1, route_w, w2.data, w2.scales, w2.expert_scale, out_down, 0, 0, glist,
+        static_cast<const uint8_t*>(w2h.data), static_cast<const uint8_t*>(w2h.scales), static_cast<const float*>(w2h.expert_scale),
+        static_cast<const uint8_t*>(w2b.data), static_cast<const uint8_t*>(w2b.scales), static_cast<const float*>(w2b.expert_scale));
+}
+
 void launch_moe_down_h(
     const ExpertBank& w2, const __half* act_h, const int32_t* route_ids, const float* route_w,
     const ExpertGroups* /*groups*/, float* out_down, int B, cudaStream_t stream, bool /*already_zeroed*/) {
     dim3 grid(HIDDEN / MOE_TILE);
-    if (w2.is_nvfp4) {
+    if (B == 1 && w2.is_nvfp4 && moe_down_persist_grid() > 0) {
+        launch_pdl(moe_down_tc_persist_kernel<0>, dim3(moe_down_persist_grid()), MOE_DOWN_WARPS * 32, stream,
+            act_h, route_ids, route_w, w2.data, w2.scales, w2.expert_scale, out_down, TOP_K, 0, static_cast<const int32_t*>(nullptr),
+            static_cast<const uint8_t*>(nullptr), static_cast<const uint8_t*>(nullptr), static_cast<const float*>(nullptr), static_cast<const uint8_t*>(nullptr), static_cast<const uint8_t*>(nullptr), static_cast<const float*>(nullptr));
+    } else if (w2.is_nvfp4) {
         launch_pdl(moe_down_tc_kernel<0>, grid, MOE_DOWN_WARPS * 32, stream,
-            act_h, route_ids, route_w, w2.data, w2.scales, w2.expert_scale, B, out_down);
+            act_h, route_ids, route_w, w2.data, w2.scales, w2.expert_scale, B, out_down, TOP_K);
     } else {
         launch_pdl(moe_down_tc_kernel<1>, grid, MOE_DOWN_WARPS * 32, stream,
-            act_h, route_ids, route_w, w2.data, w2.scales, static_cast<const float*>(nullptr), B, out_down);
+            act_h, route_ids, route_w, w2.data, w2.scales, static_cast<const float*>(nullptr), B, out_down, TOP_K);
     }
 }
 

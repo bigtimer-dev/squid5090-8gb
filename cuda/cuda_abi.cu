@@ -11,6 +11,7 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <sys/mman.h>
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -407,6 +408,52 @@ int32_t squid_cuda_mem_get_info(size_t* free_bytes, size_t* total_bytes) {
     return (int32_t)cudaMemGetInfo(free_bytes, total_bytes);
 }
 int32_t squid_cuda_free_host(void* ptr) { return (int32_t)cudaFreeHost(ptr); }
+
+// Host memory in 2 MiB transparent huge pages (anonymous mmap + MADV_HUGEPAGE, faulted in), pinned and mapped for
+// zero-copy with cudaHostRegister. cudaHostAlloc pins 4 KiB pages whose physical contiguity depends on how fragmented
+// RAM is at load time, so the CPU expert path's streaming rate (TLB reach) varied from run to run.
+// *thp_bytes = AnonHugePages of the mapping (/proc/self/smaps), to report how much of it got huge pages.
+static size_t thp_len(size_t bytes) {
+    const size_t huge = size_t(2) << 20;
+    return (bytes + huge - 1) & ~(huge - 1);
+}
+int32_t squid_cuda_malloc_host_thp(void** ptr, size_t bytes, size_t* thp_bytes) {
+    const size_t huge = size_t(2) << 20, len = thp_len(bytes);
+    char* raw = static_cast<char*>(mmap(nullptr, len + huge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (raw == MAP_FAILED) return -1;
+    char* p = reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(raw) + huge - 1) & ~(uintptr_t)(huge - 1));
+    if (p > raw) munmap(raw, p - raw);
+    if (raw + len + huge > p + len) munmap(p + len, (raw + len + huge) - (p + len));
+    madvise(p, len, MADV_HUGEPAGE);
+    for (size_t o = 0; o < len; o += huge) p[o] = 0;  // one fault per 2 MiB (falls back to 4 KiB pages if none free)
+    *thp_bytes = 0;
+    if (FILE* f = fopen("/proc/self/smaps", "r")) {
+        char line[512];
+        bool in = false;
+        while (fgets(line, sizeof line, f)) {
+            unsigned long a = 0, b = 0;
+            if (sscanf(line, "%lx-%lx ", &a, &b) == 2 && line[0] != ' ') {
+                in = a <= reinterpret_cast<uintptr_t>(p) && reinterpret_cast<uintptr_t>(p) < b;
+            } else if (in) {
+                unsigned long kb = 0;
+                if (sscanf(line, "AnonHugePages: %lu kB", &kb) == 1) *thp_bytes += size_t(kb) << 10;
+            }
+        }
+        fclose(f);
+    }
+    const cudaError_t e = cudaHostRegister(p, len, cudaHostRegisterMapped | cudaHostRegisterPortable);
+    if (e != cudaSuccess) {
+        munmap(p, len);
+        return (int32_t)e;
+    }
+    *ptr = p;
+    return 0;
+}
+int32_t squid_cuda_free_host_thp(void* ptr, size_t bytes) {
+    const cudaError_t e = cudaHostUnregister(ptr);
+    munmap(ptr, thp_len(bytes));
+    return (int32_t)e;
+}
 int32_t squid_cuda_host_get_device_pointer(void** dev_ptr, void* host_ptr) {
     return (int32_t)cudaHostGetDevicePointer(dev_ptr, host_ptr, 0);
 }
@@ -424,6 +471,10 @@ int32_t squid_cuda_memcpy_d2h_async(void* dst, const void* src, size_t bytes, vo
 }
 int32_t squid_cuda_memcpy_d2d_async(void* dst, const void* src, size_t bytes, void* stream) {
     return (int32_t)cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, static_cast<cudaStream_t>(stream));
+}
+// Direction inferred from the pointers (UVA): e.g. a mapped pinned host buffer's device alias -> VRAM.
+int32_t squid_cuda_memcpy_default_async(void* dst, const void* src, size_t bytes, void* stream) {
+    return (int32_t)cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, static_cast<cudaStream_t>(stream));
 }
 int32_t squid_cuda_memset_async(void* dst, int32_t value, size_t bytes, void* stream) {
     return (int32_t)cudaMemsetAsync(dst, value, bytes, static_cast<cudaStream_t>(stream));
@@ -691,6 +742,22 @@ void squid_launch_moe_down_h(
     const void* groups, float* out_down, int32_t B, void* stream) {
     launch_moe_down_h(to_eb(*w2), static_cast<const __half*>(act_h), route_ids, route_w,
                       static_cast<const ExpertGroups*>(groups), out_down, B, static_cast<cudaStream_t>(stream), true);
+}
+
+void squid_launch_moe_slots_h(
+    const CExpertBank* w13, const CExpertBank* w2, const void* x_h, const int32_t* route_ids, const float* route_w,
+    void* act_h, float* out_down, int32_t kslots, int32_t k_split, void* stream) {
+    launch_moe_slots_h(to_eb(*w13), to_eb(*w2), static_cast<const __half*>(x_h), route_ids, route_w,
+                       static_cast<__half*>(act_h), out_down, kslots, k_split, static_cast<cudaStream_t>(stream));
+}
+
+void squid_launch_moe_slots_list_h(
+    const CExpertBank* w13, const CExpertBank* w2, const CExpertBank* w13b, const CExpertBank* w2b,
+    const CExpertBank* w13h, const CExpertBank* w2h, const void* x_h, const float* route_w, void* act_h,
+    float* out_down, const int32_t* glist, void* stream) {
+    launch_moe_slots_list_h(to_eb(*w13), to_eb(*w2), to_eb(*w13b), to_eb(*w2b), to_eb(*w13h), to_eb(*w2h),
+                            static_cast<const __half*>(x_h), route_w,
+                            static_cast<__half*>(act_h), out_down, glist, static_cast<cudaStream_t>(stream));
 }
 
 void squid_launch_mega_mlp_post_res(

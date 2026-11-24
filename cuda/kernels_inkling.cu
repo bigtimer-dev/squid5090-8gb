@@ -1,6 +1,8 @@
 #include "kernels.hpp"
 #include "kernels_common.cuh"
 
+#include <cstdlib>
+
 namespace squid {
 
 namespace {
@@ -1582,6 +1584,221 @@ mega_controller_nvfp4_kernel(
     }
 }
 
+// B = 1 split of mega_controller_nvfp4_kernel over many SMs, bit-identical to it. The single 1024-thread block of the
+// original streams ~330 KB of controller weights through one SM (~33 us per call, 48 calls per token). Here:
+//   ctrl_split_down_kernel  grid (32, n_streams) x 256: every block redoes the depth attention + both RMS norms and
+//                           computes 2 of the 64 down rows (warp 0 and 1, same per-row code as the original).
+//   ctrl_split_up_kernel    grid (36, n_streams) x 256: 64 forget/gain rows per block; the last block to finish
+//                           computes the output norm and writes all 2304 outputs.
+// Every reduction keeps the original's order: a 1024-thread block-wide sum is emulated with 4 "virtual threads"
+// per thread (vt = tid + 256 j has the same lane and its warp is warp + 8 j), and per-row work uses the same lanes.
+constexpr int CTRL_SPLIT_DOWN_BLOCKS = GATE_RANK / 2;  // 32
+constexpr int CTRL_SPLIT_UP_ROWS = 64;
+constexpr int CTRL_SPLIT_UP_BLOCKS = HIDDEN / CTRL_SPLIT_UP_ROWS;  // 36
+
+struct CtrlSplitScratch {
+    float msg[3][HIDDEN];
+    __half d[3][GATE_RANK];
+    float merged[3][HIDDEN];
+    unsigned int done[3];
+};
+__device__ CtrlSplitScratch g_ctrl_split;
+
+__global__ void __launch_bounds__(256)
+ctrl_split_down_kernel(MutPtr3 xs, const float* __restrict__ saved, const float* __restrict__ prior_last,
+                       Ptr3 cp_queries, CtrlNVFP4Ptr3 cws) {
+    pdl_wait();
+    pdl_trigger();
+    const int s = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;  // 0..7
+
+    __shared__ __half s_cat[2 * HIDDEN];
+    __shared__ float s_msg[HIDDEN];
+    __shared__ float sm0[32], sm1[32], smx[32];
+    __shared__ float w0, w1, inv_x, inv_m;
+
+    const float* q = cp_queries.p[s];
+    const float* sv = saved;
+    const float* pl = prior_last;
+    const float* xb = xs.p[s];
+
+    // 1. Depth attention + norm(x)
+    float d0[4], d1[4], xsq[4];
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        d0[j] = 0.0f; d1[j] = 0.0f; xsq[j] = 0.0f;
+        for (int d = tid + 256 * j; d < HIDDEN; d += 1024) {
+            float qv = q[d];
+            d0[j] = fmaf(qv, sv[d], d0[j]);
+            d1[j] = fmaf(qv, pl[d], d1[j]);
+            float xv = xb[d];
+            xsq[j] = fmaf(xv, xv, xsq[j]);
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        float a = warp_sum(d0[j]), b = warp_sum(d1[j]), c = warp_sum(xsq[j]);
+        if (lane == 0) { sm0[warp + 8 * j] = a; sm1[warp + 8 * j] = b; smx[warp + 8 * j] = c; }
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float t0 = warp_sum(sm0[lane]);
+        float t1 = warp_sum(sm1[lane]);
+        float tx = warp_sum(smx[lane]);
+        if (lane == 0) {
+            float l0 = t0 * INV_SQRT_HIDDEN, l1 = t1 * INV_SQRT_HIDDEN;
+            float mx = fmaxf(l0, l1);
+            float e0 = expf(l0 - mx), e1 = expf(l1 - mx);
+            float inv = 1.0f / (e0 + e1);
+            w0 = e0 * inv; w1 = e1 * inv;
+            inv_x = rsqrtf(tx / float(HIDDEN) + RMS_EPS);
+        }
+    }
+    __syncthreads();
+
+    float ww0 = w0, ww1 = w1, ix = inv_x;
+    float msq[4];
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        msq[j] = 0.0f;
+        for (int d = tid + 256 * j; d < HIDDEN; d += 1024) {
+            float mv = ww0 * sv[d] + ww1 * pl[d];
+            s_msg[d] = mv;
+            s_cat[d] = __float2half(xb[d] * ix);
+            msq[j] = fmaf(mv, mv, msq[j]);
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        float a = warp_sum(msq[j]);
+        if (lane == 0) sm0[warp + 8 * j] = a;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float tm = warp_sum(sm0[lane]);
+        if (lane == 0) inv_m = rsqrtf(tm / float(HIDDEN) + RMS_EPS);
+    }
+    __syncthreads();
+    float im = inv_m;
+    for (int d = tid; d < HIDDEN; d += 256) s_cat[HIDDEN + d] = __float2half(s_msg[d] * im);
+    __syncthreads();
+
+    if (blockIdx.x == 0) {
+        for (int d = tid; d < HIDDEN; d += 256) g_ctrl_split.msg[s][d] = s_msg[d];
+    }
+
+    // 2. Down projection rows 2 * blockIdx.x + {0, 1} (warps 0, 1), same per-row code as the original.
+    if (warp < 2) {
+        const uint8_t* dd = cws.down_d[s];
+        const uint8_t* ds = cws.down_s[s];
+        float dgs = cws.down_gs[s];
+        constexpr int D_NBLK = (2 * HIDDEN) >> 4;
+        int r = 2 * blockIdx.x + warp;
+        const uint2* wr = reinterpret_cast<const uint2*>(dd + (size_t)r * HIDDEN);
+        const uint8_t* sr = ds + (size_t)r * D_NBLK;
+        float acc = 0.0f;
+        #pragma unroll
+        for (int iter = 0; iter < 9; ++iter) {
+            int blk = lane + iter * 32;
+            uint2 w8 = __ldg(wr + blk);
+            float sc = cvt_e4m3_to_float(__ldg(sr + blk));
+            const __half2* xh = reinterpret_cast<const __half2*>(s_cat + (blk << 4));
+            acc = fmaf(nvfp4_block16_dot(w8, xh), sc, acc);
+        }
+        float val = warp_sum(acc) * dgs;
+        if (lane == 0) g_ctrl_split.d[s][r] = __float2half(val);
+    }
+}
+
+__global__ void __launch_bounds__(256)
+ctrl_split_up_kernel(MutPtr3 xs, CtrlNVFP4Ptr3 cws, BF16Ptr3 post_norms, MutPtr3 outs, HalfPtr3 outs_h) {
+    pdl_wait();
+    pdl_trigger();
+    const int s = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+
+    __shared__ __half s_d[GATE_RANK];
+    __shared__ float sm0[32];
+    __shared__ float inv_r;
+    __shared__ int s_last;
+    if (tid < GATE_RANK) s_d[tid] = g_ctrl_split.d[s][tid];
+    __syncthreads();
+
+    const float* xb = xs.p[s];
+
+    // 3. Forget / gain rows of this block (4 threads per row, same lanes and shuffles as the original).
+    const uint8_t* fd = cws.forget_d[s]; const uint8_t* fs = cws.forget_s[s]; float fgs = cws.forget_gs[s];
+    const uint8_t* gd = cws.gain_d[s];   const uint8_t* gs = cws.gain_s[s];   float ggs = cws.gain_gs[s];
+    int sub = tid & 3;
+    int c = blockIdx.x * CTRL_SPLIT_UP_ROWS + (tid >> 2);
+    const __half2* dh_sub = reinterpret_cast<const __half2*>(s_d + (sub << 4));
+    uint2 fw8 = __ldg(reinterpret_cast<const uint2*>(fd + (size_t)c * 32) + sub);
+    uint2 gw8 = __ldg(reinterpret_cast<const uint2*>(gd + (size_t)c * 32) + sub);
+    float fsc = cvt_e4m3_to_float(__ldg(fs + (size_t)c * 4 + sub));
+    float gsc = cvt_e4m3_to_float(__ldg(gs + (size_t)c * 4 + sub));
+    float af = nvfp4_block16_dot(fw8, dh_sub) * fsc;
+    float ag = nvfp4_block16_dot(gw8, dh_sub) * gsc;
+    af += __shfl_xor_sync(0xffffffffu, af, 1);
+    af += __shfl_xor_sync(0xffffffffu, af, 2);
+    ag += __shfl_xor_sync(0xffffffffu, ag, 1);
+    ag += __shfl_xor_sync(0xffffffffu, ag, 2);
+    if (sub == 0) {
+        float merged = (1.0f - fast_tanh(af * fgs)) * xb[c] + fast_tanh(ag * ggs) * g_ctrl_split.msg[s][c];
+        g_ctrl_split.merged[s][c] = merged;
+    }
+
+    // 4. The last block to finish: output RMS norm in the original order, then all outputs.
+    __syncthreads();
+    if (tid == 0) {
+        __threadfence();
+        unsigned int prev = atomicAdd(&g_ctrl_split.done[s], 1u);
+        s_last = (prev == gridDim.x - 1);
+    }
+    __syncthreads();
+    if (!s_last) return;
+    __threadfence();
+    const float* mg = g_ctrl_split.merged[s];
+    float osq[4];
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int vt = tid + 256 * j;
+        osq[j] = 0.0f;
+        if ((vt & 3) == 0) {
+            const int row_grp = vt >> 2;
+            #pragma unroll
+            for (int iter = 0; iter < 9; ++iter) {
+                float m = __ldcg(mg + row_grp + iter * 256);
+                osq[j] = fmaf(m, m, osq[j]);
+            }
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        float a = warp_sum(osq[j]);
+        if (lane == 0) sm0[warp + 8 * j] = a;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float tot = warp_sum(sm0[lane]);
+        if (lane == 0) inv_r = rsqrtf(tot / float(HIDDEN) + RMS_EPS);
+    }
+    __syncthreads();
+    float ir = inv_r;
+    const __nv_bfloat16* nw = post_norms.p[s];
+    float* ob = outs.p[s];
+    __half* ohb = outs_h.p[s];
+    for (int cc = tid; cc < HIDDEN; cc += 256) {
+        float v = __ldcg(mg + cc) * ir * __bfloat162float(nw[cc]);
+        ob[cc] = v;
+        if (ohb) ohb[cc] = __float2half(v);
+    }
+    if (tid == 0) g_ctrl_split.done[s] = 0;
+}
+
 // Vectorized 4-channel short-conv helper (2x uint4 weight loads + float4 data loads!)
 __device__ __forceinline__ float4 sconv_apply_f4(
     const float* __restrict__ src,
@@ -2779,6 +2996,13 @@ void launch_controller_mega_nvfp4(
         cp.gain_s[s] = cws[idx]->gain_nvfp4.scales;
         cp.gain_gs[s] = cws[idx]->gain_nvfp4.global_scale;
         np.p[s] = post_norms[idx];
+    }
+    static const int split = [] { const char* v = getenv("SQUID_CTRL_SPLIT"); return v ? atoi(v) : 0; }();
+    if (B == 1 && split) {
+        launch_pdl(ctrl_split_down_kernel, dim3(CTRL_SPLIT_DOWN_BLOCKS, n_streams), 256, stream,
+            xp, saved, prior_last, qp, cp);
+        launch_pdl(ctrl_split_up_kernel, dim3(CTRL_SPLIT_UP_BLOCKS, n_streams), 256, stream, xp, cp, np, op, ohp);
+        return;
     }
     mega_controller_nvfp4_kernel<<<dim3(B, n_streams), 1024, 0, stream>>>(
         xp, saved, prior_last, qp, cp, np, op, ohp);

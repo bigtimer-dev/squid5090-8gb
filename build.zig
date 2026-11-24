@@ -45,6 +45,7 @@ pub fn build(b: *std.Build) void {
         "cuda/weights.hpp",
         "cuda/kernels.hpp",
         "cuda/kernels_common.cuh",
+        "cpu/cpu_moe.h",
     };
 
     const cuda_sources = [_]struct { src: []const u8, obj: []const u8 }{
@@ -53,6 +54,7 @@ pub fn build(b: *std.Build) void {
         .{ .src = "cuda/kernels_dspark.cu", .obj = "kernels_dspark.o" },
         .{ .src = "cuda/kernels_prefill.cu", .obj = "kernels_prefill.o" },
         .{ .src = "cuda/cuda_abi.cu", .obj = "cuda_abi.o" },
+        .{ .src = "cuda/kernels_cpumoe.cu", .obj = "kernels_cpumoe.o" },
     };
 
     for (cuda_sources) |cu| {
@@ -76,6 +78,10 @@ pub fn build(b: *std.Build) void {
         }
         root_module.addObjectFile(obj_file);
     }
+
+    // CPU expert compute for decode (AVX-512 with a scalar fallback, chosen at run time).
+    root_module.addCSourceFile(.{ .file = b.path("cpu/cpu_moe.c"), .flags = &.{ "-O3", "-std=gnu11", "-fno-strict-aliasing" } });
+    root_module.addIncludePath(b.path("cpu"));
 
     root_module.addLibraryPath(.{ .cwd_relative = cuda_lib });
     root_module.linkSystemLibrary("cudart", .{});

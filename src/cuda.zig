@@ -83,12 +83,15 @@ pub extern "c" fn squid_cuda_free(ptr: ?*anyopaque) i32;
 pub extern "c" fn squid_cuda_malloc_host_pinned(ptr: *?*anyopaque, bytes: usize, mapped: u8) i32;
 pub extern "c" fn squid_cuda_free_host(ptr: ?*anyopaque) i32;
 pub extern "c" fn squid_cuda_mem_get_info(free_bytes: *usize, total_bytes: *usize) i32;
+pub extern "c" fn squid_cuda_malloc_host_thp(ptr: *?*anyopaque, bytes: usize, thp_bytes: *usize) i32;
+pub extern "c" fn squid_cuda_free_host_thp(ptr: ?*anyopaque, bytes: usize) i32;
 pub extern "c" fn squid_cuda_host_get_device_pointer(dev_ptr: *?*anyopaque, host_ptr: *anyopaque) i32;
 pub extern "c" fn squid_cuda_memcpy_h2d(dst: *anyopaque, src: *const anyopaque, bytes: usize) i32;
 pub extern "c" fn squid_cuda_memcpy_d2h(dst: *anyopaque, src: *const anyopaque, bytes: usize) i32;
 pub extern "c" fn squid_cuda_memcpy_h2d_async(dst: *anyopaque, src: *const anyopaque, bytes: usize, stream: ?*anyopaque) i32;
 pub extern "c" fn squid_cuda_memcpy_d2h_async(dst: *anyopaque, src: *const anyopaque, bytes: usize, stream: ?*anyopaque) i32;
 pub extern "c" fn squid_cuda_memcpy_d2d_async(dst: *anyopaque, src: *const anyopaque, bytes: usize, stream: ?*anyopaque) i32;
+pub extern "c" fn squid_cuda_memcpy_default_async(dst: *anyopaque, src: *const anyopaque, bytes: usize, stream: ?*anyopaque) i32;
 pub extern "c" fn squid_cuda_memset_async(dst: *anyopaque, value: i32, bytes: usize, stream: ?*anyopaque) i32;
 pub extern "c" fn squid_cuda_device_sync() i32;
 pub extern "c" fn squid_cuda_stream_create(out_stream: *?*anyopaque) i32;
@@ -401,6 +404,48 @@ pub extern "c" fn squid_launch_moe_down_h(
     batch_size: i32,
     stream: ?*anyopaque,
 ) void;
+
+// CPU expert path for B = 1 decode (cpu/cpu_moe.c + cuda/kernels_cpumoe.cu).
+pub extern "c" fn squid_launch_cpu_moe_post(x_h: *const anyopaque, ids: [*]const i32, wts: [*]const f32, shared_dev: *anyopaque, seq_ctr: [*]u32, layer: i32, slot_begin: i32, k_split: i32, stream: ?*anyopaque) void;
+pub extern "c" fn squid_launch_l2_prefetch_if(ptrs: [*]const ?*const anyopaque, bytes: [*]const u32, n: i32, mode: i32, gate: ?[*]const i32, stream: ?*anyopaque) void;
+pub extern "c" fn squid_launch_l2_prefetch(ptrs: [*]const ?*const anyopaque, bytes: [*]const u32, n: i32, mode: i32, stream: ?*anyopaque) void;
+pub extern "c" fn squid_launch_cpu_moe_wait_add(shared_dev: *anyopaque, seq_ctr: [*]const u32, out: [*]f32, err: [*]i32, stream: ?*anyopaque) void;
+pub extern "c" fn squid_launch_moe_slots_list_h(w13: *const CExpertBank, w2: *const CExpertBank, w13b: *const CExpertBank, w2b: *const CExpertBank, w13h: *const CExpertBank, w2h: *const CExpertBank, x_h: *const anyopaque, route_w: [*]const f32, act_h: *anyopaque, out_down: [*]f32, glist: [*]const i32, stream: ?*anyopaque) void;
+pub extern "c" fn squid_launch_cpu_moe_post_cache(x_h: *const anyopaque, ids: [*]const i32, wts: [*]const f32, shared_dev: *anyopaque, seq_ctr: [*]u32, layer: i32, cmap_l: [*]const i32, glist: [*]i32, hist_l: ?[*]u32, pcie_h: i32, stream: ?*anyopaque) void;
+pub extern "c" fn squid_launch_cpu_moe_wait_add_if(shared_dev: *anyopaque, seq_ctr: [*]const u32, out: [*]f32, err: [*]i32, posted: [*]const i32, stream: ?*anyopaque) void;
+pub extern "c" fn squid_launch_moe_slots_h(w13: *const CExpertBank, w2: *const CExpertBank, x_h: *const anyopaque, route_ids: [*]const i32, route_w: [*]const f32, act_h: *anyopaque, out_down: [*]f32, kslots: i32, k_split: i32, stream: ?*anyopaque) void;
+pub extern "c" fn squid_launch_cpu_moe_exchange(
+    x_h: *const anyopaque,
+    ids: [*]const i32,
+    wts: [*]const f32,
+    shared_dev: *anyopaque,
+    seq_ctr: [*]u32,
+    layer: i32,
+    out: [*]f32,
+    err: [*]i32,
+    stream: ?*anyopaque,
+) void;
+pub extern "c" fn cpu_moe_available() c_int;
+pub extern "c" fn cpu_moe_set_layer(
+    layer: c_int,
+    w13_codes: [*]const u8,
+    w13_scales: [*]const u8,
+    es13: [*]const f32,
+    w2_codes: [*]const u8,
+    w2_scales: [*]const u8,
+    es2: [*]const f32,
+) void;
+pub extern "c" fn cpu_moe_start(shared_host: *anyopaque, n_threads: c_int, cpus: ?[*]const c_int) c_int;
+pub extern "c" fn cpu_moe_kick() void;
+pub extern "c" fn cpu_moe_stop() void;
+pub extern "c" fn cpu_moe_stats(requests: *u64, busy_ns: *u64, max_ns: *u64) void;
+pub extern "c" fn cpu_moe_shared_bytes() usize;
+pub extern "c" fn cpu_moe_kernel_name() [*:0]const u8;
+pub extern "c" fn cpu_moe_pin_current_thread(cpu: c_int) void;
+pub extern "c" fn cpu_moe_write_file(path: [*:0]const u8, data: *const anyopaque, bytes: usize) c_int;
+pub extern "c" fn cpu_moe_read_tokens(path: [*:0]const u8, out: [*]i32, max: c_int) c_int;
+pub extern "c" fn cpu_moe_score_logits(logits: [*]const f32, vocab: c_int, forced: i32, rec: [*]f32) void;
+pub extern "c" fn squid_launch_route_trace(ids: [*]const i32, trace_dev: *anyopaque, tok_ctr: [*]u32, visit: i32, visits: i32, n_max: i32, is_last: i32, stream: ?*anyopaque) void;
 
 pub extern "c" fn squid_launch_mega_mlp_post_res(
     moe_down_or_slots: [*]const f32,

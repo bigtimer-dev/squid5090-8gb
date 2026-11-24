@@ -94,6 +94,21 @@ void launch_moe_gate_up_h(
     int B,
     cudaStream_t stream);
 
+// GPU part of a GPU + CPU split decode visit (B = 1): up + down for top-k slots [0, kslots) only, into out_down;
+// k_split > 0 (multiple of 128): also intermediate rows [0, k_split) of slot kslots (the CPU does the rest of it).
+void launch_moe_slots_h(
+    const ExpertBank& w13, const ExpertBank& w2, const __half* x_h, const int32_t* route_ids, const float* route_w,
+    __half* act_h, float* out_down, int kslots, int k_split, cudaStream_t stream);
+
+// Decode expert cache (B = 1): up + down for the cached slots of a CPU-served visit, from the VRAM cache banks (expert
+// index = cache slot) listed by the post kernel in glist ([0] = n, [1 + j] = cache slot, [9 + j] = top-k slot).
+// An entry MOE_HOST_TAG | e reads expert e of the layer's host bank (w13h / w2h) over PCIe instead, and
+// MOE_BANK2_TAG | c slot c of the second (persistent) cache bank (w13b / w2b).
+void launch_moe_slots_list_h(
+    const ExpertBank& w13, const ExpertBank& w2, const ExpertBank& w13b, const ExpertBank& w2b, const ExpertBank& w13h,
+    const ExpertBank& w2h, const __half* x_h, const float* route_w, __half* act_h, float* out_down, const int32_t* glist,
+    cudaStream_t stream);
+
 // MoE Down + Weighted Top-K Reduction (reads half act!)
 void launch_moe_down_h(
     const ExpertBank& w2,

@@ -4,6 +4,7 @@
 
 ## What this fork changes
 
+- **Generation is ~4× faster when the CPU computes the experts that live in RAM** (opt-in, see [Fast generation](#fast-generation-cpu--gpu-experts)): 48–50 tok/s instead of 12.5 on a short prompt at 64K context. While one sequence generates, the CPU computes the routed experts held in host RAM straight from RAM and the GPU computes the rest. The ~170 most-used host experts are also copied into VRAM that only prompt processing needs.
 - **Experts that don't fit in VRAM are read from host RAM.** Upstream keeps every weight in VRAM (15.6 GiB at 8K context). Here, the expert banks beyond the VRAM budget go into one mapped, pinned host buffer that the GPU reads zero-copy over PCIe. VRAM goes to the looped core layers first, because layers 6–17 run three times per token. If everything fits, nothing moves.
 - **`--uncensor PATH` applies the [AtomicChat uncensored LoRA](https://huggingface.co/AtomicChat/Inkling-2-Mini-Uncensored-GGUF) exactly.** That rank-1 LoRA is a projection removal, `y -= b·(b·y)`, on the attention output and on every expert's down projection, plus an edit to the embedding table. A new kernel applies the projection before the short conv. Upstream's `--ablation` hook runs after the conv, so it can't reproduce the LoRA. [`tools/uncensor-lora/`](tools/uncensor-lora/) checks the equivalence on the real weights and bakes the embedding edit into a reflinked copy of the checkpoint.
 - **Loads in 16–18 s instead of ~2.5–3 min.** Layers 20–23 ship as MXFP8 and are converted to NVFP4 at load. For banks bound for host RAM, the conversion now runs in VRAM staging and the result is copied to the host by DMA; storing straight into mapped host memory ran at ~12 MB/s. Large safetensors files are read with `O_DIRECT` through a pinned bounce buffer.
@@ -24,25 +25,65 @@ The load log shows the split, for example `[weights] Experts: 18/48 banks in VRA
 
 For the uncensored model, build its folder with [`tools/uncensor-lora/make_uncensored.py`](tools/uncensor-lora/make_uncensored.py) (the steps are in its header), serve that folder, and add `--uncensor <folder>/uncensor.safetensors`.
 
+## Fast generation: CPU + GPU experts
+
+```bash
+export SQUID_CPU_MOE=1 SQUID_CPU_MOE_GPU_SLOTS=1 SQUID_CPU_MOE_DOWN=kouter SQUID_CPU_MOE_L2PF=2 \
+       SQUID_CPU_MOE_KEEPALIVE=20 SQUID_MOE_UP_PERSIST=1 SQUID_MOE_DOWN_PERSIST=1 SQUID_CTRL_SPLIT=1 \
+       SQUID_DECODE_CACHE=tools/decode-cache/inkling-2-mini-routing-prior.bin SQUID_DECODE_CACHE_LAYERS=host \
+       SQUID_DECODE_CACHE_PCIE=2 SQUID_DECODE_CACHE_ADAPT=16,16,0.9,4,reset
+./zig-out/bin/squid5090 serve /opt/models/inkling-2-mini \
+  --mode nvfp4 --embed-host --mtp 0 --ctx 65536 --kv fp8 --host 127.0.0.1 --port 8080
+```
+
+How one generated token runs at 64K context with fp8 KV on the 8 GB card:
+- **9 layers keep their experts in VRAM.** They account for 27 of the 48 layer visits per token, because layers 6–17 run three times. Their experts run on the unchanged GPU kernels.
+- **The other 15 layers keep their experts in pinned host RAM** and get 21 visits per token. In each of these visits:
+  - The routed experts that are in the VRAM decode cache run on the GPU.
+  - When at most 2 of the 8 are cached, the GPU also reads one more over PCIe.
+  - Meanwhile the CPU computes the rest straight from RAM: 8 threads pinned to CPUs 0–7, AVX-512 VNNI on int16 activations, with work stealing. The GPU then adds the CPU's partial sum.
+- **The decode cache lives in the prefill buffers**, which sit idle while one sequence generates. That is 169 experts (722 MiB) on this card.
+  - Each request starts from the experts that a routing prior ranks highest ([`tools/decode-cache/`](tools/decode-cache/)).
+  - Every 16 tokens, up to 16 cached experts are swapped for ones this request uses more.
+  - Refilling the cache costs ~60 ms per request.
+- **`SQUID_CPU_MOE_KEEPALIVE=20` keeps the AMD fabric clock up.** While generating, one CPU thread reads a private 64 MB buffer at up to 20 GB/s. Without that traffic, the fabric clock (FCLK) drops from 1960 to 1400 MHz during the GPU-only stretches of each token, and the CPU then reads RAM up to 30% slower.
+
+Requirements and costs:
+- **CPU:** needs AVX-512 (F/BW/DQ/VBMI, plus VNNI for the int16 kernel). Without it the log prints `[cpu-moe] needs AVX-512 ...` and the engine stays GPU-only.
+- **Scope:** only one-sequence generation uses this path; batched prefill and multi-sequence decode don't.
+- **CPU load:** 8 cores work while a sequence generates and sleep when the server is idle.
+
+**Numerical change:** greedy output is not bit-identical to the GPU-only path, because the CPU kernels round differently from the GPU's. It was compared with the GPU-only path on the uncensored model, teacher-forced:
+- Mean NLL difference: −0.0035 ± 0.0027 nats on 1024 tokens of upstream's README, and +0.0009 ± 0.0017 on 256 tokens of a greedy answer.
+- The top token agreed at 1001/1024 and 253/256 positions. Every disagreement was a near-tie (top-2 margin < 0.11).
+- A fact placed at 10% and at 50% depth of a 64K-token prompt was still retrieved, and tool calls pass, plain and streamed.
+
 ## Results on the RTX 4060 Laptop (8 GB)
 
-Both engines got the same prompts: 64K context, 8-bit KV cache, the uncensored model, temperature 0. llama.cpp runs the Q4_K GGUF with the experts on the CPU except for 6 loop layers (`-ub 64`, `q8_0` KV, 8 threads).
+Both engines got the same prompts: 64K context, 8-bit KV cache, the uncensored model, temperature 0. llama.cpp runs the Q4_K GGUF with the experts on the CPU except for 6 loop layers (`-ub 64`, `q8_0` KV, 8 threads). "GPU experts" is this fork's default; "CPU + GPU experts" uses the settings above.
 
-| | llama.cpp | squid5090-8gb |
-|---|---:|---:|
-| Generation, short prompt | **18.6 tok/s** | 12.5 tok/s |
-| Generation after 12.6K tokens of context | **15.9 tok/s** | 12.2 tok/s |
-| Generation after 46K tokens of context | — | 11.7 tok/s |
-| Reading a 3.8K-token prompt | 76 tok/s (51 s) | **509 tok/s (7.5 s)** |
-| Reading a 12.6K-token prompt | 70 tok/s (181 s) | **495 tok/s (25.5 s)** |
-| Reading a 46K-token prompt | — | **500 tok/s (93 s)** |
+| | llama.cpp | GPU experts | CPU + GPU experts |
+|---|---:|---:|---:|
+| Generation, short prompt | 18.6 tok/s | 12.5 tok/s | **48–50 tok/s** |
+| Generation after 12.6K tokens of context | 15.9 tok/s | 12.2 tok/s | **42.8 tok/s** |
+| Generation after 32K tokens of context | — | — | **39.2 tok/s** |
+| Generation after 46K tokens of context | — | 11.7 tok/s | — |
+| Generation after 64K tokens of context | — | — | **34–35 tok/s** |
+| Reading a 3.8K-token prompt | 76 tok/s (51 s) | **509 tok/s (7.5 s)** | same path |
+| Reading a 12.6K-token prompt | 70 tok/s (181 s) | **495 tok/s (25.5 s)** | **500 tok/s (25.2 s)** |
+| Reading a 46K-token prompt | — | **500 tok/s (93 s)** | same path |
 
-Generation is limited by PCIe: at 64K context, 42 of the 96 expert-bank visits per token are read from host RAM. Each bank that fits in VRAM adds about 0.5 tok/s, so a smaller context helps: `--ctx 32768` reaches 14.0 tok/s, and `--kv q4` reaches 13.6 tok/s at 64K (q4 quality not evaluated). Tool calls (plain and streamed) and the prefix cache work: the second turn of a 12.6K-token conversation starts in 0.8 s.
+With CPU + GPU experts the short-prompt speed is ~48 tok/s at first and ~50 after a few minutes of steady load. The change follows the CPU's RAM bandwidth, which rises from ~48 to ~54 GB/s; the cause is unknown and is not temperature.
+
+With GPU experts, generation is limited by PCIe: at 64K context, 42 of the 96 expert-bank visits per token are read from host RAM. Each bank that fits in VRAM adds about 0.5 tok/s, so a smaller context helps: `--ctx 32768` reaches 14.0 tok/s, and `--kv q4` reaches 13.6 tok/s at 64K (q4 quality not evaluated). With CPU + GPU experts, the limits are the CPU's RAM bandwidth and the many small GPU kernels per layer. On this Ryzen 9 8945HS, RAM reads top out at 62.7 GB/s at FCLK 1960 MHz, and the path reaches ~54. Tool calls (plain and streamed) and the prefix cache work in both modes: the second turn of a 12.6K-token conversation starts in 0.8 s.
 
 What didn't help on this machine:
 - MTP drafting: 13.6 tok/s with it versus 14.6 without, at 8K context, because verifying drafts pulls in more experts over PCIe.
 - Write-combined host memory: no change.
 - A 1024-token prefill chunk: generation gains ~1 tok/s, but prompts are read at only ~410 tok/s.
+- Transparent huge pages for the host experts (`SQUID_HOST_THP=1`): no change.
+- Keeping the decode cache from one request to the next instead of starting from the prior: ~3% slower when the topic changes.
+- A second decode-cache bank (`SQUID_DECODE_CACHE_N2=128` with `SQUID_EXPERT_VRAM_MB=4380`): generation +1.4–1.9%, but short prompts take +130 ms. Left off.
 
 Only `--mode nvfp4` has been tested with the offload.
 
@@ -56,6 +97,22 @@ Only `--mode nvfp4` has been tested with the offload.
 | `SQUID_PREFILL_CHUNK` | `2048` | Prefill batch size (32–2048, multiple of 8) |
 | `SQUID_HOST_WC` | `0` | `1` = write-combined host expert buffer |
 | `SQUID_LOAD_TRACE` | `0` | `1` = per-phase and per-bank load timings |
+| `SQUID_CPU_MOE` | `0` | `1` = the CPU computes host-RAM experts in one-sequence decode |
+| `SQUID_CPU_MOE_THREADS` | `8` | CPU worker threads, pinned to CPUs 0..n-1 (`SQUID_CPU_MOE_PIN=0` unpins, `SQUID_CPU_MOE_CPUS=a,b,...` picks CPUs) |
+| `SQUID_CPU_MOE_GPU_SLOTS` | `0` | The GPU computes this many of a host visit's experts over PCIe while the CPU works (`1` is best here) |
+| `SQUID_CPU_MOE_DOWN` | row order | `kouter` = down projection in k-outer order (faster here, bit-identical) |
+| `SQUID_CPU_MOE_L2PF` | off | While the GPU waits for the CPU, read the next visit's dense weights (QKVRG + o_proj) into its L2: `1` plain loads, `2` evict-last priority |
+| `SQUID_CPU_MOE_KEEPALIVE` | off | GB/s of background RAM reads while decoding, to hold the fabric clock up |
+| `SQUID_MOE_UP_PERSIST`, `SQUID_MOE_DOWN_PERSIST` | `0` | `1` = persistent-grid GPU expert kernels (one wave of CTAs loops over the work) |
+| `SQUID_CTRL_SPLIT` | `0` | `1` = split the controller kernel in two for one-sequence decode (more parallel) |
+| `SQUID_DECODE_CACHE` | off | Routing prior (`[24][128]` u32 counts) that seeds the VRAM decode cache |
+| `SQUID_DECODE_CACHE_LAYERS` | `loop` | Layers the cache may hold: `loop`, `host` (all CPU-served layers) or a hex mask |
+| `SQUID_DECODE_CACHE_PCIE` | `-1` | On a visit with at most this many experts cached, the GPU also reads one uncached expert over PCIe |
+| `SQUID_DECODE_CACHE_ADAPT` | off | `N,M,decay,W[,reset]`: every N tokens swap up to M experts by score W·prior + decayed session uses; `reset` starts each request from the prior |
+| `SQUID_DECODE_CACHE_N`, `SQUID_DECODE_CACHE_N2` | all that fit, `0` | Cap on cached experts; extra slots in a dedicated VRAM bank |
+| `SQUID_ROUTE_TRACE` | off | Path: write every decode token's top-8 experts per layer visit at exit (input for `tools/decode-cache/route_prior.py`) |
+
+The other `SQUID_CPU_MOE_*` variables and `SQUID_DECODE_BANK`, `SQUID_E2M1_LUT`, `SQUID_HOST_THP`, `SQUID_BLOCKING_SYNC`, `SQUID_ENGINE_CPU`, `SQUID_ATTN_NO_PREFETCH` and `SQUID_SCORE_*` are experiment or diagnostic switches. Their defaults are the measured best.
 
 ---
 

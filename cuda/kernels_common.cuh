@@ -126,13 +126,19 @@ __device__ __forceinline__ __half2 cvt_e2m1x2_to_half2(uint32_t byte_val) {
         "  mov.b16 {b0, b1}, %1;\n"
         "  cvt.rn.f16x2.e2m1x2 %0, b0; }\n"
         : "=r"(out) : "h"(tmp));
-#else
+#elif defined(SQUID_E2M1_LUT)
     static constexpr float lut[16] = {
         0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
         -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
     };
     __half2 h = __floats2half2_rn(lut[byte_val & 0xFu], lut[(byte_val >> 4) & 0xFu]);
     out = *reinterpret_cast<uint32_t*>(&h);
+#else
+    // Pre-Blackwell: byte-permute decode in registers (see cvt_e2m1x8_to_half2x4), same bits as the LUT above.
+    const uint32_t b = byte_val & 0xFFu;
+    uint32_t hb = __byte_perm(0x3E3C3800u, 0x46444240u, b & 0x77u);
+    hb |= __byte_perm(b << 4, b, 0x40) & 0x8080u;
+    out = __byte_perm(hb, 0u, 0x1404);
 #endif
     return *reinterpret_cast<__half2*>(&out);
 }
@@ -153,11 +159,28 @@ __device__ __forceinline__ void cvt_e2m1x8_to_half2x4(
     h1 = *reinterpret_cast<__half2*>(&r1);
     h2 = *reinterpret_cast<__half2*>(&r2);
     h3 = *reinterpret_cast<__half2*>(&r3);
-#else
+#elif defined(SQUID_E2M1_LUT)
     h0 = cvt_e2m1x2_to_half2(w & 0xFFu);
     h1 = cvt_e2m1x2_to_half2((w >> 8) & 0xFFu);
     h2 = cvt_e2m1x2_to_half2((w >> 16) & 0xFFu);
     h3 = cvt_e2m1x2_to_half2((w >> 24) & 0xFFu);
+#else
+    // Pre-Blackwell (no cvt.e2m1x2): the LUT path costs one global load per weight, which caps a GEMV whose weights
+    // sit in L2 well below L2 bandwidth. Byte-permute decode instead, 13 ALU ops per 8 weights, bit-identical to the
+    // LUT (checked over all 2^32 words, incl. -0.0 for code 8). An e2m1 magnitude m = code & 7 (0 .5 1 1.5 2 3 4 6)
+    // is the fp16 value hb[m] << 8 with hb = {00 38 3C 3E 40 42 44 46}; the code's sign bit becomes bit 7 of hb.
+    const uint32_t mag = w & 0x77777777u;
+    const uint32_t w4 = w << 4;  // bit 7 of byte k: w4 -> sign of nibble 2k, w -> sign of nibble 2k + 1
+    uint32_t lo = __byte_perm(0x3E3C3800u, 0x46444240u, mag);        // hb of nibbles 0..3
+    uint32_t hi = __byte_perm(0x3E3C3800u, 0x46444240u, mag >> 16);  // hb of nibbles 4..7
+    lo |= __byte_perm(w4, w, 0x5140) & 0x80808080u;
+    hi |= __byte_perm(w4, w, 0x7362) & 0x80808080u;
+    const uint32_t r0 = __byte_perm(lo, 0u, 0x1404), r1 = __byte_perm(lo, 0u, 0x3424);
+    const uint32_t r2 = __byte_perm(hi, 0u, 0x1404), r3 = __byte_perm(hi, 0u, 0x3424);
+    h0 = *reinterpret_cast<const __half2*>(&r0);
+    h1 = *reinterpret_cast<const __half2*>(&r1);
+    h2 = *reinterpret_cast<const __half2*>(&r2);
+    h3 = *reinterpret_cast<const __half2*>(&r3);
 #endif
 }
 
@@ -418,6 +441,62 @@ __device__ __forceinline__ uint4 load_kv_8elems_h2x4(
     return *reinterpret_cast<uint4*>(h);
 }
 
+// load_kv_8elems_h2x4 split in two for register prefetch: load_kv_8elems_raw issues the same global loads, and
+// kv_raw_to_h2x4 decodes them later with the identical arithmetic (same 4x half2 result, bit for bit).
+template <int KV_FMT> struct KvRaw8;
+template <> struct KvRaw8<0> { uint4 d; };
+template <> struct KvRaw8<1> { uint2 d; __half sc; };
+template <> struct KvRaw8<2> { uint32_t d; __half sc; };
+
+template <int KV_FMT>
+__device__ __forceinline__ KvRaw8<KV_FMT> load_kv_8elems_raw(
+    const void* __restrict__ cache, const __half* __restrict__ scales,
+    int slot, int kvh, int sub) {
+    KvRaw8<KV_FMT> r;
+    if constexpr (KV_FMT == 0) {
+        r.d = __ldg(reinterpret_cast<const uint4*>(
+            static_cast<const __nv_bfloat16*>(cache) + (size_t)slot * KV_DIM + kvh * HEAD_DIM) + sub);
+    } else if constexpr (KV_FMT == 1) {
+        r.d = __ldg(reinterpret_cast<const uint2*>(
+            static_cast<const uint8_t*>(cache) + (size_t)slot * KV_DIM + kvh * HEAD_DIM) + sub);
+        r.sc = __ldg(scales + (size_t)slot * NUM_KV_HEADS + kvh);
+    } else {
+        r.d = __ldg(reinterpret_cast<const uint32_t*>(
+            static_cast<const uint8_t*>(cache) + (size_t)slot * (KV_DIM >> 1) + kvh * 64) + sub);
+        r.sc = __ldg(scales + (size_t)slot * KV_Q4_SCALES_PER_TOK + kvh * 2 + (sub >> 3));
+    }
+    return r;
+}
+
+template <int KV_FMT>
+__device__ __forceinline__ uint4 kv_raw_to_h2x4(const KvRaw8<KV_FMT>& r) {
+    __half2 h[4];
+    if constexpr (KV_FMT == 0) {
+        const __nv_bfloat162* b = reinterpret_cast<const __nv_bfloat162*>(&r.d);
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            float2 f = __bfloat1622float2(b[i]);
+            h[i] = __floats2half2_rn(f.x, f.y);
+        }
+    } else if constexpr (KV_FMT == 1) {
+        __half2 hsc = __half2half2(r.sc);
+        h[0] = __hmul2(cvt_e4m3x2_to_half2(static_cast<uint16_t>(r.d.x & 0xFFFFu)), hsc);
+        h[1] = __hmul2(cvt_e4m3x2_to_half2(static_cast<uint16_t>(r.d.x >> 16)), hsc);
+        h[2] = __hmul2(cvt_e4m3x2_to_half2(static_cast<uint16_t>(r.d.y & 0xFFFFu)), hsc);
+        h[3] = __hmul2(cvt_e4m3x2_to_half2(static_cast<uint16_t>(r.d.y >> 16)), hsc);
+    } else {
+        __half2 hsc = __half2half2(r.sc);
+        __half2 h1031 = __float2half2_rn(1031.0f);
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            uint32_t pair = (r.d >> (i * 8)) & 0xFFu;
+            uint32_t u32 = (0x6400u | (pair & 0xFu)) | ((0x6400u | (pair >> 4)) << 16);
+            h[i] = __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&u32), h1031), hsc);
+        }
+    }
+    return *reinterpret_cast<uint4*>(h);
+}
+
 // Shared Blackwell FP16 Tensor Core (m16n8k16 + ldmatrix.x4 / ldmatrix.x2.trans) Split-K Bulk Engine!
 // TILE_T = 32 (2 slices x 16 tokens): 17.4 KB SMEM (s_k + s_v together -> ONLY 2 syncs/tile, 4-5 blocks/SM!).
 // NM = 1 (THREADS=64) for Q_CNT <= 16 (B=1..5); NM = 2 (THREADS=128) for Q_CNT <= 32 (B=6..8, DSpark).
@@ -529,8 +608,50 @@ __device__ __forceinline__ void run_tc_bulk_splitk(
     int k_ld_col = (lane & 8);
     int v_ld_row = t_base + (lane & 15);
 
+#ifndef SQUID_ATTN_NO_PREFETCH
+    // Register prefetch: the next tile's K/V loads are issued before this tile's MMAs, so every CTA keeps its
+    // loads in flight while it computes (and a CTA alone in the last wave is no longer latency-bound).
+    // Same per-thread (t_loc, sub) mapping as the plain loop below -> identical shared-memory tiles.
+    constexpr int PER = 512 / THREADS;
+    KvRaw8<KV_FMT> rk[PER], rv[PER];
+    #pragma unroll
+    for (int i = 0; i < PER; ++i) {
+        const int idx = tid + i * THREADS, t_loc = idx >> 4, sub = idx & 15;
+        if (t_loc < min(32, t_end - t_start)) {
+            const int slot = (t_start + t_loc) % kv_cap;
+            rk[i] = load_kv_8elems_raw<KV_FMT>(k_cache, k_scale, slot, kvh, sub);
+            rv[i] = load_kv_8elems_raw<KV_FMT>(v_cache, v_scale, slot, kvh, sub);
+        }
+    }
+#endif
     for (int t0 = t_start; t0 < t_end; t0 += 32) {
         int tile_len = min(32, t_end - t0);
+#ifndef SQUID_ATTN_NO_PREFETCH
+        #pragma unroll
+        for (int i = 0; i < PER; ++i) {
+            const int idx = tid + i * THREADS, t_loc = idx >> 4, sub = idx & 15;
+            if (t_loc < tile_len) {
+                *reinterpret_cast<uint4*>(&smem.kv.s_k[t_loc][sub * 8]) = kv_raw_to_h2x4<KV_FMT>(rk[i]);
+                *reinterpret_cast<uint4*>(&smem.kv.s_v[t_loc][sub * 8]) = kv_raw_to_h2x4<KV_FMT>(rv[i]);
+            } else {
+                *reinterpret_cast<uint4*>(&smem.kv.s_k[t_loc][sub * 8]) = make_uint4(0, 0, 0, 0);
+                *reinterpret_cast<uint4*>(&smem.kv.s_v[t_loc][sub * 8]) = make_uint4(0, 0, 0, 0);
+            }
+        }
+        __syncthreads();
+        if (t0 + 32 < t_end) {
+            const int n0 = t0 + 32, nlen = min(32, t_end - n0);
+            #pragma unroll
+            for (int i = 0; i < PER; ++i) {
+                const int idx = tid + i * THREADS, t_loc = idx >> 4, sub = idx & 15;
+                if (t_loc < nlen) {
+                    const int slot = (n0 + t_loc) % kv_cap;
+                    rk[i] = load_kv_8elems_raw<KV_FMT>(k_cache, k_scale, slot, kvh, sub);
+                    rv[i] = load_kv_8elems_raw<KV_FMT>(v_cache, v_scale, slot, kvh, sub);
+                }
+            }
+        }
+#else
         // 1. Load K AND V together in one coalesced HBM burst (512 tasks: 32 tok x 16 sub)
         #pragma unroll
         for (int idx = tid; idx < 512; idx += THREADS) {
@@ -548,6 +669,7 @@ __device__ __forceinline__ void run_tc_bulk_splitk(
             }
         }
         __syncthreads();
+#endif
 
         int w_len = min(16, max(0, tile_len - t_base));
         if (w_len > 0) {

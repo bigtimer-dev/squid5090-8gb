@@ -68,6 +68,7 @@ pub const ModelWeights = struct {
     // allocation and are read zero-copy over PCIe. Bit (2 * layer + {0: w13, 1: w2}) set = bank on host.
     host_expert_banks: u64 = 0,
     pinned_host_experts: ?*anyopaque = null,
+    host_experts_thp: bool = false, // SQUID_HOST_THP=1: allocated by squid_cuda_malloc_host_thp (2 MiB pages)
     host_expert_dev: ?[*]u8 = null,
     host_expert_capacity: u64 = 0,
     host_expert_offset: u64 = 0,
@@ -98,7 +99,11 @@ pub const ModelWeights = struct {
             self.pinned_host_embed = null;
         }
         if (self.pinned_host_experts) |host_ptr| {
-            tiger.assert_cuda(cuda.squid_cuda_free_host(host_ptr));
+            if (self.host_experts_thp) {
+                tiger.assert_cuda(cuda.squid_cuda_free_host_thp(host_ptr, @intCast(self.host_expert_capacity)));
+            } else {
+                tiger.assert_cuda(cuda.squid_cuda_free_host(host_ptr));
+            }
             self.pinned_host_experts = null;
         }
         self.* = .{};
@@ -235,7 +240,15 @@ pub const ModelWeights = struct {
             const env_wc = tiger.getenv("SQUID_HOST_WC");
             const wc_flag: u8 = if (env_wc != null and env_wc.?[0] == '1') 2 else 0;
             var h_ptr: ?*anyopaque = null;
-            tiger.assert_cuda(cuda.squid_cuda_malloc_host_pinned(&h_ptr, @intCast(host_bytes), 1 | wc_flag));
+            const env_thp = tiger.getenv("SQUID_HOST_THP");
+            if (env_thp != null and env_thp.?[0] == '1' and wc_flag == 0) {
+                var thp: usize = 0;
+                tiger.assert_cuda(cuda.squid_cuda_malloc_host_thp(&h_ptr, @intCast(host_bytes), &thp));
+                self.host_experts_thp = true;
+                tiger.print_stdout("[weights] host experts in transparent huge pages: {d:.2} of {d:.2} GiB in 2 MiB pages\n", .{ @as(f64, @floatFromInt(thp)) / 1073741824.0, @as(f64, @floatFromInt(host_bytes)) / 1073741824.0 });
+            } else {
+                tiger.assert_cuda(cuda.squid_cuda_malloc_host_pinned(&h_ptr, @intCast(host_bytes), 1 | wc_flag));
+            }
             tiger.assert(h_ptr != null);
             var d_ptr: ?*anyopaque = null;
             tiger.assert_cuda(cuda.squid_cuda_host_get_device_pointer(&d_ptr, h_ptr.?));

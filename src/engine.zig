@@ -175,6 +175,95 @@ pub const Engine = struct {
     join_event: ?*anyopaque = null,
     done_event: ?*anyopaque = null,
 
+    // CPU expert path (decode, B = 1): layers whose two expert banks both live in host RAM are computed by CPU
+    // threads (cpu/cpu_moe.c, RAM bandwidth) instead of being streamed to the GPU over PCIe. Bit l = physical
+    // layer l; 0 = off. cpu_moe_ctr[0] = request sequence counter, [1] = timeout flag (device memory).
+    cpu_moe_layers: u32 = 0,
+    // SQUID_CPU_MOE_GPU_SLOTS=n (0-7): the GPU computes top-k slots [0, n) of each CPU-served visit over PCIe
+    // (zero-copy) while the CPU computes the rest; both read host RAM at the same time.
+    cpu_moe_gpu_slots: i32 = 0,
+    // SQUID_CPU_MOE_GPU_KSPLIT=k (multiple of 128, < 1152; needs GPU_SLOTS): the GPU also computes intermediate
+    // rows [0, k) of slot GPU_SLOTS, the CPU the rest of that slot (balances the two sides).
+    cpu_moe_gpu_ksplit: i32 = 0,
+    cpu_moe_l2pf: i32 = 0,
+    // SQUID_DECODE_BANK=1|<layer>: B = 1 decode never touches the batched-prefill buffers (~0.7 GiB at the end of
+    // the runtime arena), so they hold a VRAM copy of one host-resident layer's two expert banks while decoding.
+    // The copy (~547 MiB over PCIe) is made before the first decode step after any batched prefill chunk (which
+    // reuses the space) and only the B = 1 decode graph reads it; every other path keeps using the host banks.
+    dbank_layer: i32 = -1,
+    dbank_valid: bool = false,
+    dbank_use: bool = false,
+    dbank_w13: cuda.CExpertBank = .{},
+    dbank_w2: cuda.CExpertBank = .{},
+    dbank_src: [4]?*const anyopaque = @splat(null),
+    dbank_dst: [4]?*anyopaque = @splat(null),
+    dbank_bytes: [4]u64 = @splat(0),
+    dbank_uploads: u64 = 0,
+    dbank_upload_ns: u64 = 0,
+    // SQUID_DECODE_CACHE=<prior>: like the decode bank, but the prefill buffers hold the most-routed experts of several
+    // CPU-served layers (chosen from a prior: [24][128] u32 routing counts, e.g. tools/decode-cache/route_prior.py). In a B = 1
+    // decode visit of such a layer the GPU computes the cached top-k slots from VRAM and the CPU the others (no PCIe
+    // slot). SQUID_DECODE_CACHE_LAYERS=loop (default: CPU-served loop layers) | host (every CPU-served layer) | 0x<mask>;
+    // SQUID_DECODE_CACHE_N=n caps the expert count (default: as many as fit). Replaces SQUID_DECODE_BANK.
+    // SQUID_DECODE_CACHE_N2=m: m more slots in a dedicated VRAM allocation (bank B: survives batched prefills, e.g. the
+    // VRAM a smaller SQUID_EXPERT_VRAM_MB leaves free). Slots [0, na) are bank A (prefill buffers), [na, n) bank B.
+    dcache_n: u32 = 0,
+    dcache_na: u32 = 0,
+    dcache_dstb: [4]?[*]u8 = @splat(null),
+    dcache_regb: ?*anyopaque = null,
+    dcache_w13b: cuda.CExpertBank = .{},
+    dcache_w2b: cuda.CExpertBank = .{},
+    dcache_loaded: []u16 = &.{}, // expert held by each bank B slot ((layer << 8) | expert; 0xffff: none)
+    dcache_valid: bool = false,
+    dcache_layers: u32 = 0,
+    dcache_w13: cuda.CExpertBank = .{},
+    dcache_w2: cuda.CExpertBank = .{},
+    dcache_dst: [4]?[*]u8 = @splat(null), // region arrays: w13 data, w13 scales, w2 data, w2 scales ([n] experts each)
+    dcache_esz: [4]u64 = @splat(0), // bytes per expert in each array
+    dcache_sel: []u16 = &.{}, // cache slot -> (layer << 8) | expert
+    dcache_cmap: ?[*]i32 = null, // device [24][128]: cache slot or -1
+    dcache_es: ?[*]f32 = null, // device [2][n]: expert scales of the cached w13 / w2 banks
+    dcache_glist: ?[*]i32 = null, // device [18]: per-visit GPU slot list (see cpu_moe_post_cache_kernel)
+    dcache_uploads: u64 = 0,
+    dcache_upload_ns: u64 = 0,
+    // SQUID_DECODE_CACHE_ADAPT=N,M[,decay[,W[,reset]]]: every N decode tokens swap up to M cached experts for hotter
+    // uncached ones. Score = W * prior uses/token + session uses (decayed by `decay` per step); an expert is admitted
+    // if its score beats the evicted one's by 25% + 0.5. The post kernel counts uses in dcache_hist (device [24][128]).
+    // reset: the session counts restart at every generate call (the selection returns to the prior's).
+    dcache_adapt_n: u32 = 0,
+    dcache_adapt_m: u32 = 0,
+    dcache_adapt_decay: f32 = 0.9,
+    dcache_adapt_w: f32 = 4.0,
+    dcache_adapt_reset: bool = false,
+    // SQUID_DECODE_CACHE_PCIE=h: on a cache visit with at most h routed experts cached, the GPU also computes the first
+    // uncached one from the host bank over PCIe (-1: never).
+    dcache_pcie_h: i32 = -1,
+    dcache_hist: ?[*]u32 = null,
+    dcache_hist_last: []u32 = &.{},
+    dcache_prior: []f32 = &.{}, // uses per token
+    dcache_sess: []f32 = &.{},
+    dcache_cmap_h: []i32 = &.{},
+    dcache_es_h: []f32 = &.{}, // [2][n]
+    dcache_les: []f32 = &.{}, // [2][24][128]: expert scales of the candidate layers (w13, w2)
+    dcache_sel0: []u16 = &.{}, // the prior's selection (for reset)
+    dcache_swaps: u64 = 0,
+    dcache_adapt_steps: u64 = 0,
+    cpu_moe_sh_host: ?*anyopaque = null,
+    cpu_moe_sh_dev: ?*anyopaque = null,
+    cpu_moe_ctr: ?[*]u32 = null,
+
+    // SQUID_ROUTE_TRACE=path: record every B = 1 decode token's top-8 expert ids per visit ([token][48][8] i32,
+    // mapped host memory) and write them to `path` at exit (prefixed by the u32 token count).
+    trace_host: ?*anyopaque = null,
+    trace_dev: ?*anyopaque = null,
+    trace_ctr: ?[*]u32 = null,
+    // Teacher-forced scoring (SQUID_SCORE_FORCE / SQUID_SCORE_OUT), see init_score.
+    score_force: []i32 = &.{},
+    score_rec: []f32 = &.{},
+    score_logits: []f32 = &.{},
+    score_len: usize = 0,
+    score_n: usize = 0,
+
     // Cached CUDA Graphs
     b1_graph_exec: ?*anyopaque = null,
     spec_graph_exec: [constants.mtp_draft_count_max + 1]?*anyopaque = @splat(null),
@@ -500,9 +589,769 @@ pub const Engine = struct {
             .{ context_tokens_max, kv_format.name(), rt_gib, self.arena.allocation_count, if (use_graphs) "on" else "off" },
         );
         self.reset();
+        self.init_cpu_moe();
+        self.init_decode_bank();
+        self.init_decode_cache();
+        self.init_route_trace();
+        self.init_score();
+    }
+
+    fn init_decode_bank(self: *Engine) void {
+        const env = std.mem.span(tiger.getenv("SQUID_DECODE_BANK") orelse return);
+        if (env.len == 0 or env[0] == '0') return;
+        const w = self.weights.?;
+        if (w.host_expert_banks == 0) return;
+        const on_host = struct {
+            fn f(wm: anytype, l: u32) bool {
+                return weights_mod.bank_on_host(wm.host_expert_banks, l, 0) and weights_mod.bank_on_host(wm.host_expert_banks, l, 1);
+            }
+        }.f;
+        // "1" = pick automatically; any other number = that physical layer.
+        var layer: i32 = -1;
+        if (std.fmt.parseInt(u32, env, 10)) |v| {
+            if (v != 1) layer = @intCast(@min(v, 1000));
+        } else |_| {}
+        if (layer < 0) {
+            // Prefer a loop layer (visited 3 x per token), then any host-resident layer.
+            var l: u32 = constants.loop_start_layer;
+            while (l < constants.loop_end_layer) : (l += 1) {
+                if (on_host(w, l)) {
+                    layer = @intCast(l);
+                    break;
+                }
+            }
+            if (layer < 0) {
+                l = 0;
+                while (l < constants.layer_count) : (l += 1) {
+                    if (on_host(w, l)) {
+                        layer = @intCast(l);
+                        break;
+                    }
+                }
+            }
+        }
+        if (layer < 0 or layer >= constants.layer_count or !on_host(w, @intCast(layer))) {
+            tiger.print_stdout("[dbank] no host-resident expert layer to copy; off\n", .{});
+            return;
+        }
+        const lw = &w.layers[@intCast(layer)];
+        if (lw.w13.is_nvfp4 == 0 or lw.w2.is_nvfp4 == 0) {
+            tiger.print_stdout("[dbank] layer {d} is not NVFP4; off\n", .{layer});
+            return;
+        }
+        const a = constants.vram_alignment_bytes;
+        const banks = [_]*const cuda.CExpertBank{ &lw.w13, &lw.w2 };
+        var need: u64 = 0;
+        for (banks, 0..) |eb, k| {
+            const n: u64 = @as(u64, @intCast(eb.n_experts)) * @as(u64, @intCast(eb.rows)) * @as(u64, @intCast(eb.cols));
+            self.dbank_bytes[2 * k] = n / 2;
+            self.dbank_bytes[2 * k + 1] = n / 16;
+            self.dbank_src[2 * k] = @ptrCast(eb.data.?);
+            self.dbank_src[2 * k + 1] = @ptrCast(eb.scales.?);
+            need += tiger.align_up_u64(n / 2, a) + tiger.align_up_u64(n / 16, a);
+        }
+        const region: [*]u8 = @ptrCast(self.p_tokens);
+        const region_end: usize = @intFromPtr(self.arena.base_ptr.?) + @as(usize, @intCast(self.arena.capacity_bytes));
+        const have: u64 = region_end - @intFromPtr(region);
+        if (need > have) {
+            tiger.print_stdout("[dbank] layer {d} needs {d:.0} MiB, prefill buffers hold {d:.0} MiB; off\n", .{ layer, @as(f64, @floatFromInt(need)) / 1048576.0, @as(f64, @floatFromInt(have)) / 1048576.0 });
+            return;
+        }
+        var off: u64 = 0;
+        for (0..4) |k| {
+            self.dbank_dst[k] = @ptrCast(region + @as(usize, @intCast(off)));
+            off += tiger.align_up_u64(self.dbank_bytes[k], a);
+        }
+        self.dbank_w13 = lw.w13;
+        self.dbank_w13.data = @ptrCast(self.dbank_dst[0].?);
+        self.dbank_w13.scales = @ptrCast(self.dbank_dst[1].?);
+        self.dbank_w2 = lw.w2;
+        self.dbank_w2.data = @ptrCast(self.dbank_dst[2].?);
+        self.dbank_w2.scales = @ptrCast(self.dbank_dst[3].?);
+        self.dbank_layer = layer;
+        self.dbank_valid = false;
+        tiger.print_stdout("[dbank] B = 1 decode reads layer {d}'s experts ({d:.0} MiB) from a VRAM copy in the prefill buffers ({d:.0} MiB)\n", .{ layer, @as(f64, @floatFromInt(need)) / 1048576.0, @as(f64, @floatFromInt(have)) / 1048576.0 });
+    }
+
+    fn init_decode_cache(self: *Engine) void {
+        const prior_path = tiger.getenv("SQUID_DECODE_CACHE") orelse return;
+        if (std.mem.span(prior_path).len == 0 or prior_path[0] == '0') return;
+        const w = self.weights.?;
+        if (self.cpu_moe_layers == 0) {
+            tiger.print_stdout("[dcache] needs the CPU expert path (SQUID_CPU_MOE=1); off\n", .{});
+            return;
+        }
+        if (self.dbank_layer >= 0) {
+            tiger.print_stdout("[dcache] replaces the decode bank (SQUID_DECODE_BANK)\n", .{});
+            self.dbank_layer = -1;
+        }
+        // Candidate layers.
+        var layers: u32 = 0;
+        const lenv: []const u8 = if (tiger.getenv("SQUID_DECODE_CACHE_LAYERS")) |v| std.mem.span(v) else "loop";
+        if (std.mem.eql(u8, lenv, "host")) {
+            layers = self.cpu_moe_layers;
+        } else if (std.mem.eql(u8, lenv, "loop")) {
+            var l: u32 = constants.loop_start_layer;
+            while (l < constants.loop_end_layer) : (l += 1) layers |= @as(u32, 1) << @intCast(l);
+            layers &= self.cpu_moe_layers;
+        } else {
+            const t = if (lenv.len > 2 and lenv[0] == '0' and (lenv[1] == 'x' or lenv[1] == 'X')) lenv[2..] else lenv;
+            layers = (std.fmt.parseInt(u32, t, 16) catch 0) & self.cpu_moe_layers;
+        }
+        if (layers == 0) {
+            tiger.print_stdout("[dcache] no CPU-served layer selected ({s}); off\n", .{lenv});
+            return;
+        }
+        // Prior: [24][128] u32 counts.
+        const ne = constants.expert_count;
+        var prior: [constants.layer_count * constants.expert_count]u32 = undefined;
+        {
+            const fd = tiger.open(prior_path, tiger.O_RDONLY);
+            if (fd < 0) {
+                tiger.print_stdout("[dcache] cannot open prior {s}; off\n", .{prior_path});
+                return;
+            }
+            defer _ = tiger.close(fd);
+            const buf: [*]u8 = @ptrCast(&prior);
+            var total: usize = 0;
+            while (total < @sizeOf(@TypeOf(prior))) {
+                const n = tiger.read(fd, buf + total, @sizeOf(@TypeOf(prior)) - total);
+                if (n <= 0) break;
+                total += @intCast(n);
+            }
+            if (total != @sizeOf(@TypeOf(prior))) {
+                tiger.print_stdout("[dcache] prior {s}: {d} bytes, expected {d}; off\n", .{ prior_path, total, @sizeOf(@TypeOf(prior)) });
+                return;
+            }
+        }
+        // Capacity of the prefill buffers, per expert: w13 (rows x cols NVFP4 + scales) + w2.
+        const l0: u32 = @ctz(layers);
+        const lw0 = &w.layers[l0];
+        const n13: u64 = @as(u64, @intCast(lw0.w13.rows)) * @as(u64, @intCast(lw0.w13.cols));
+        const n2: u64 = @as(u64, @intCast(lw0.w2.rows)) * @as(u64, @intCast(lw0.w2.cols));
+        self.dcache_esz = .{ n13 / 2, n13 / 16, n2 / 2, n2 / 16 };
+        const a = constants.vram_alignment_bytes;
+        for (self.dcache_esz) |b| tiger.assert(b % a == 0);
+        const per_expert: u64 = self.dcache_esz[0] + self.dcache_esz[1] + self.dcache_esz[2] + self.dcache_esz[3];
+        const region: [*]u8 = @ptrCast(self.p_tokens);
+        const region_end: usize = @intFromPtr(self.arena.base_ptr.?) + @as(usize, @intCast(self.arena.capacity_bytes));
+        const have: u64 = region_end - @intFromPtr(region);
+        var cap: u64 = have / per_expert;
+        if (tiger.getenv("SQUID_DECODE_CACHE_N")) |v| cap = @min(cap, std.fmt.parseInt(u64, std.mem.span(v), 10) catch cap);
+        const cap_a: u64 = cap;
+        if (tiger.getenv("SQUID_DECODE_CACHE_N2")) |v| cap += std.fmt.parseInt(u64, std.mem.span(v), 10) catch 0;
+        // Rank (layer, expert) by prior count; ties: lower layer, lower expert.
+        var cand: [constants.layer_count * constants.expert_count]u32 = undefined;
+        var nc: usize = 0;
+        var l: u32 = 0;
+        while (l < constants.layer_count) : (l += 1) {
+            if ((layers >> @intCast(l)) & 1 == 0) continue;
+            const lw = &w.layers[l];
+            tiger.assert(lw.w13.is_nvfp4 != 0 and lw.w2.is_nvfp4 != 0 and lw.w13.rows == lw0.w13.rows and lw.w13.cols == lw0.w13.cols and lw.w2.rows == lw0.w2.rows and lw.w2.cols == lw0.w2.cols);
+            for (0..ne) |e| {
+                cand[nc] = l * ne + @as(u32, @intCast(e));
+                nc += 1;
+            }
+        }
+        const Ctx = struct {
+            p: *const [constants.layer_count * constants.expert_count]u32,
+            fn lt(ctx: @This(), x: u32, y: u32) bool {
+                if (ctx.p[x] != ctx.p[y]) return ctx.p[x] > ctx.p[y];
+                return x < y;
+            }
+        };
+        std.sort.pdq(u32, cand[0..nc], Ctx{ .p = &prior }, Ctx.lt);
+        var n: usize = @intCast(@min(cap, nc));
+        const na: usize = @intCast(@min(cap_a, n));
+        if (n > na) {
+            var p_b: ?*anyopaque = null;
+            if (cuda.squid_cuda_malloc(&p_b, @intCast(per_expert * (n - na))) != 0 or p_b == null) {
+                tiger.print_stdout("[dcache] bank B: cannot allocate {d} slots; off\n", .{n - na});
+                n = na;
+            } else {
+                self.dcache_regb = p_b;
+                var offb: u64 = 0;
+                for (0..4) |k| {
+                    self.dcache_dstb[k] = @as([*]u8, @ptrCast(p_b.?)) + @as(usize, @intCast(offb));
+                    offb += self.dcache_esz[k] * (n - na);
+                }
+            }
+        }
+        self.dcache_na = @intCast(na);
+        if (n == 0) {
+            tiger.print_stdout("[dcache] no room ({d:.0} MiB); off\n", .{@as(f64, @floatFromInt(have)) / 1048576.0});
+            return;
+        }
+        // Cache slot order: by (layer, expert), so the uploads read host RAM in order.
+        std.sort.pdq(u32, cand[0..n], {}, std.sort.asc(u32));
+        self.dcache_sel = std.heap.page_allocator.alloc(u16, n) catch unreachable;
+        var cmap: [constants.layer_count * constants.expert_count]i32 = @splat(-1);
+        var es_h = std.heap.page_allocator.alloc(f32, 2 * n) catch unreachable;
+        defer std.heap.page_allocator.free(es_h);
+        var es13: [constants.expert_count]f32 = undefined;
+        var es2: [constants.expert_count]f32 = undefined;
+        var cur_l: u32 = 0xffff;
+        var covered: u64 = 0;
+        var total_cnt: u64 = 0;
+        l = 0;
+        while (l < constants.layer_count) : (l += 1) {
+            if ((layers >> @intCast(l)) & 1 == 0) continue;
+            for (0..ne) |e| total_cnt += prior[l * ne + e];
+        }
+        for (cand[0..n], 0..) |id, c| {
+            const cl: u32 = id / ne;
+            const ce: u32 = id % ne;
+            if (cl != cur_l) {
+                const lw = &w.layers[cl];
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h(@ptrCast(&es13), @ptrCast(lw.w13.expert_scale.?), @sizeOf(@TypeOf(es13))));
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h(@ptrCast(&es2), @ptrCast(lw.w2.expert_scale.?), @sizeOf(@TypeOf(es2))));
+                cur_l = cl;
+            }
+            self.dcache_sel[c] = @intCast((cl << 8) | ce);
+            cmap[id] = self.dcache_enc(c);
+            es_h[c] = es13[ce];
+            es_h[n + c] = es2[ce];
+            covered += prior[id];
+        }
+        // Host state for adaptation (cheap; kept even when adaptation is off).
+        const nn = constants.layer_count * ne;
+        const pa = std.heap.page_allocator;
+        self.dcache_cmap_h = pa.alloc(i32, nn) catch unreachable;
+        @memcpy(self.dcache_cmap_h, &cmap);
+        self.dcache_es_h = pa.alloc(f32, 2 * n) catch unreachable;
+        @memcpy(self.dcache_es_h, es_h);
+        self.dcache_sel0 = pa.alloc(u16, n) catch unreachable;
+        @memcpy(self.dcache_sel0, self.dcache_sel);
+        self.dcache_prior = pa.alloc(f32, nn) catch unreachable;
+        self.dcache_sess = pa.alloc(f32, nn) catch unreachable;
+        self.dcache_hist_last = pa.alloc(u32, nn) catch unreachable;
+        self.dcache_les = pa.alloc(f32, 2 * nn) catch unreachable;
+        @memset(self.dcache_sess, 0);
+        @memset(self.dcache_hist_last, 0);
+        @memset(self.dcache_les, 0);
+        {
+            // prior uses per token over the candidate layers: (count share) x (8 slots x visits/token of those layers)
+            var uses_per_tok: f64 = 0;
+            for (self.schedule) |v| {
+                if ((layers >> @intCast(v.physical_layer)) & 1 == 1) uses_per_tok += @floatFromInt(constants.top_k_experts);
+            }
+            for (self.dcache_prior, 0..) |*x, k| {
+                const in_layers = (layers >> @intCast(k / ne)) & 1 == 1;
+                x.* = if (in_layers and total_cnt > 0) @floatCast(@as(f64, @floatFromInt(prior[k])) / @as(f64, @floatFromInt(total_cnt)) * uses_per_tok) else 0;
+            }
+            var ll: u32 = 0;
+            while (ll < constants.layer_count) : (ll += 1) {
+                if ((layers >> @intCast(ll)) & 1 == 0) continue;
+                const lw = &w.layers[ll];
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h(@ptrCast(self.dcache_les.ptr + ll * ne), @ptrCast(lw.w13.expert_scale.?), ne * @sizeOf(f32)));
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h(@ptrCast(self.dcache_les.ptr + nn + ll * ne), @ptrCast(lw.w2.expert_scale.?), ne * @sizeOf(f32)));
+            }
+        }
+        if (tiger.getenv("SQUID_DECODE_CACHE_PCIE")) |v| {
+            self.dcache_pcie_h = std.fmt.parseInt(i32, std.mem.span(v), 10) catch -1;
+            tiger.print_stdout("[dcache] PCIe slot when at most {d} of 8 are cached\n", .{self.dcache_pcie_h});
+        }
+        if (tiger.getenv("SQUID_DECODE_CACHE_ADAPT")) |v| {
+            var it = std.mem.splitScalar(u8, std.mem.span(v), ',');
+            const a_n = std.fmt.parseInt(u32, it.next() orelse "0", 10) catch 0;
+            const a_m = std.fmt.parseInt(u32, it.next() orelse "8", 10) catch 8;
+            if (it.next()) |x| self.dcache_adapt_decay = std.fmt.parseFloat(f32, x) catch 0.9;
+            if (it.next()) |x| self.dcache_adapt_w = std.fmt.parseFloat(f32, x) catch 4.0;
+            if (it.next()) |x| self.dcache_adapt_reset = std.mem.eql(u8, x, "reset");
+            if (a_n > 0 and a_m > 0) {
+                var p_h: ?*anyopaque = null;
+                tiger.assert_cuda(cuda.squid_cuda_malloc(&p_h, nn * @sizeOf(u32)));
+                tiger.assert_cuda(cuda.squid_cuda_memset_async(p_h.?, 0, nn * @sizeOf(u32), self.stream));
+                self.dcache_hist = @ptrCast(@alignCast(p_h.?));
+                self.dcache_adapt_n = a_n;
+                self.dcache_adapt_m = @min(a_m, 64);
+                tiger.print_stdout("[dcache] adaptive: every {d} tokens up to {d} swaps (decay {d:.2}, prior weight {d:.1}{s})\n", .{ a_n, self.dcache_adapt_m, self.dcache_adapt_decay, self.dcache_adapt_w, if (self.dcache_adapt_reset) ", reset per request" else "" });
+            }
+        }
+        var p_cmap: ?*anyopaque = null;
+        var p_es: ?*anyopaque = null;
+        var p_gl: ?*anyopaque = null;
+        tiger.assert_cuda(cuda.squid_cuda_malloc(&p_cmap, @sizeOf(@TypeOf(cmap))));
+        tiger.assert_cuda(cuda.squid_cuda_malloc(&p_es, 2 * n * @sizeOf(f32)));
+        tiger.assert_cuda(cuda.squid_cuda_malloc(&p_gl, 32 * @sizeOf(i32)));
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(p_cmap.?, @ptrCast(&cmap), @sizeOf(@TypeOf(cmap))));
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(p_es.?, @ptrCast(es_h.ptr), 2 * n * @sizeOf(f32)));
+        tiger.assert_cuda(cuda.squid_cuda_memset_async(p_gl.?, 0, 32 * @sizeOf(i32), self.stream));
+        tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+        self.dcache_cmap = @ptrCast(@alignCast(p_cmap.?));
+        self.dcache_es = @ptrCast(@alignCast(p_es.?));
+        self.dcache_glist = @ptrCast(@alignCast(p_gl.?));
+        var off: u64 = 0;
+        for (0..4) |k| {
+            self.dcache_dst[k] = region + @as(usize, @intCast(off));
+            off += self.dcache_esz[k] * na;
+        }
+        tiger.assert(off <= have);
+        self.dcache_w13 = lw0.w13;
+        self.dcache_w13.n_experts = @intCast(n);
+        self.dcache_w13.data = self.dcache_dst[0];
+        self.dcache_w13.scales = self.dcache_dst[1];
+        self.dcache_w13.expert_scale = self.dcache_es.?;
+        self.dcache_w2 = lw0.w2;
+        self.dcache_w2.n_experts = @intCast(n);
+        self.dcache_w2.data = self.dcache_dst[2];
+        self.dcache_w2.scales = self.dcache_dst[3];
+        self.dcache_w2.expert_scale = self.dcache_es.? + n;
+        self.dcache_w13.n_experts = @intCast(na);
+        self.dcache_w2.n_experts = @intCast(na);
+        self.dcache_w13b = self.dcache_w13;
+        self.dcache_w2b = self.dcache_w2;
+        if (n > na) {
+            self.dcache_w13b.n_experts = @intCast(n - na);
+            self.dcache_w13b.data = self.dcache_dstb[0];
+            self.dcache_w13b.scales = self.dcache_dstb[1];
+            self.dcache_w13b.expert_scale = self.dcache_es.? + na;
+            self.dcache_w2b.n_experts = @intCast(n - na);
+            self.dcache_w2b.data = self.dcache_dstb[2];
+            self.dcache_w2b.scales = self.dcache_dstb[3];
+            self.dcache_w2b.expert_scale = self.dcache_es.? + n + na;
+        }
+        self.dcache_loaded = std.heap.page_allocator.alloc(u16, n - na) catch unreachable;
+        @memset(self.dcache_loaded, 0xffff);
+        self.dcache_layers = layers;
+        self.dcache_n = @intCast(n);
+        self.dcache_valid = false;
+        tiger.print_stdout("[dcache] B = 1 decode: {d} experts of layers mask 0x{x:0>6} cached, {d} in the prefill buffers ({d:.0} of {d:.0} MiB) + {d} in bank B ({d:.0} MiB); prior covers {d:.1}% of their routing\n", .{ n, layers, na, @as(f64, @floatFromInt(off)) / 1048576.0, @as(f64, @floatFromInt(have)) / 1048576.0, n - na, @as(f64, @floatFromInt(per_expert * (n - na))) / 1048576.0, if (total_cnt > 0) 100.0 * @as(f64, @floatFromInt(covered)) / @as(f64, @floatFromInt(total_cnt)) else 0.0 });
+    }
+
+    /// Device address of array k (w13 data, w13 scales, w2 data, w2 scales) of cache slot c.
+    fn dcache_slot_ptr(self: *const Engine, k: usize, c: usize) [*]u8 {
+        const sz: usize = @intCast(self.dcache_esz[k]);
+        return if (c < self.dcache_na) self.dcache_dst[k].? + c * sz else self.dcache_dstb[k].? + (c - self.dcache_na) * sz;
+    }
+
+    /// cmap / glist entry of cache slot c (MOE_BANK2_TAG in kernels_gemv.cu marks bank B).
+    fn dcache_enc(self: *const Engine, c: usize) i32 {
+        return if (c < self.dcache_na) @intCast(c) else @intCast((1 << 17) | (c - self.dcache_na));
+    }
+
+    fn dcache_dec(self: *const Engine, v: i32) usize {
+        const u: usize = @intCast(v);
+        return if (u & (1 << 17) != 0) self.dcache_na + (u & 0xffff) else u;
+    }
+
+    fn ensure_decode_cache(self: *Engine) void {
+        if (self.dcache_n == 0 or self.dcache_valid) return;
+        const w = self.weights.?;
+        const t0: u64 = tiger.clock_monotonic_ns();
+        for (self.dcache_sel, 0..) |id, c| {
+            if (c >= self.dcache_na) {
+                if (self.dcache_loaded[c - self.dcache_na] == id) continue;
+                self.dcache_loaded[c - self.dcache_na] = id;
+            }
+            const lw = &w.layers[id >> 8];
+            const e: u64 = id & 0xff;
+            const srcs = [4]*const anyopaque{ @ptrCast(lw.w13.data.?), @ptrCast(lw.w13.scales.?), @ptrCast(lw.w2.data.?), @ptrCast(lw.w2.scales.?) };
+            for (0..4) |k| {
+                const sz = self.dcache_esz[k];
+                const src: [*]const u8 = @ptrCast(srcs[k]);
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_default_async(@ptrCast(self.dcache_slot_ptr(k, c)), @ptrCast(src + e * sz), @intCast(sz), self.stream));
+            }
+        }
+        tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+        self.dcache_upload_ns += tiger.clock_monotonic_ns() - t0;
+        self.dcache_uploads += 1;
+        self.dcache_valid = true;
+    }
+
+    /// Between decode tokens (stream idle): fold the post kernel's routing counts into the session scores and swap up
+    /// to M cached experts for hotter uncached ones (copies queued on the decode stream, before the next token).
+    fn adapt_decode_cache(self: *Engine) void {
+        if (self.dcache_adapt_n == 0 or !self.dcache_valid) return;
+        const ne = constants.expert_count;
+        const nn = constants.layer_count * ne;
+        var hist: [constants.layer_count * constants.expert_count]u32 = undefined;
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h(@ptrCast(&hist), @ptrCast(self.dcache_hist.?), nn * @sizeOf(u32)));
+        const W = self.dcache_adapt_w;
+        // candidate ids: experts of the cache layers
+        var cached: [constants.layer_count * constants.expert_count]u32 = undefined;
+        var uncached: [constants.layer_count * constants.expert_count]u32 = undefined;
+        var nc: usize = 0;
+        var nu: usize = 0;
+        var score: [constants.layer_count * constants.expert_count]f32 = undefined;
+        for (0..nn) |k| {
+            if ((self.dcache_layers >> @intCast(k / ne)) & 1 == 0) continue;
+            const d = hist[k] -% self.dcache_hist_last[k];
+            self.dcache_hist_last[k] = hist[k];
+            self.dcache_sess[k] = self.dcache_sess[k] * self.dcache_adapt_decay + @as(f32, @floatFromInt(d));
+            score[k] = W * self.dcache_prior[k] + self.dcache_sess[k];
+            if (self.dcache_cmap_h[k] >= 0) {
+                cached[nc] = @intCast(k);
+                nc += 1;
+            } else {
+                uncached[nu] = @intCast(k);
+                nu += 1;
+            }
+        }
+        const Ctx = struct {
+            sc: *const [constants.layer_count * constants.expert_count]f32,
+            fn asc(ctx: @This(), x: u32, y: u32) bool {
+                return ctx.sc[x] < ctx.sc[y] or (ctx.sc[x] == ctx.sc[y] and x < y);
+            }
+            fn desc(ctx: @This(), x: u32, y: u32) bool {
+                return ctx.sc[x] > ctx.sc[y] or (ctx.sc[x] == ctx.sc[y] and x < y);
+            }
+        };
+        std.sort.pdq(u32, cached[0..nc], Ctx{ .sc = &score }, Ctx.asc);
+        std.sort.pdq(u32, uncached[0..nu], Ctx{ .sc = &score }, Ctx.desc);
+        self.dcache_adapt_steps += 1;
+        const w = self.weights.?;
+        const n: usize = self.dcache_n;
+        var swaps: usize = 0;
+        while (swaps < self.dcache_adapt_m and swaps < nc and swaps < nu) : (swaps += 1) {
+            const ev = cached[swaps];
+            const ad = uncached[swaps];
+            if (!(score[ad] > score[ev] * 1.25 + 0.5)) break;
+            const c: usize = self.dcache_dec(self.dcache_cmap_h[ev]);
+            self.dcache_cmap_h[ev] = -1;
+            self.dcache_cmap_h[ad] = self.dcache_enc(c);
+            const al: u32 = ad / ne;
+            const ae: u64 = ad % ne;
+            self.dcache_sel[c] = @intCast((al << 8) | @as(u32, @intCast(ae)));
+            if (c >= self.dcache_na) self.dcache_loaded[c - self.dcache_na] = self.dcache_sel[c];
+            self.dcache_es_h[c] = self.dcache_les[ad];
+            self.dcache_es_h[n + c] = self.dcache_les[nn + ad];
+            const lw = &w.layers[al];
+            const srcs = [4]*const anyopaque{ @ptrCast(lw.w13.data.?), @ptrCast(lw.w13.scales.?), @ptrCast(lw.w2.data.?), @ptrCast(lw.w2.scales.?) };
+            for (0..4) |k| {
+                const sz = self.dcache_esz[k];
+                const src: [*]const u8 = @ptrCast(srcs[k]);
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_default_async(@ptrCast(self.dcache_slot_ptr(k, c)), @ptrCast(src + ae * sz), @intCast(sz), self.stream));
+            }
+        }
+        if (swaps > 0) {
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.dcache_cmap.?), @ptrCast(self.dcache_cmap_h.ptr), nn * @sizeOf(i32), self.stream));
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.dcache_es.?), @ptrCast(self.dcache_es_h.ptr), 2 * n * @sizeOf(f32), self.stream));
+            self.dcache_swaps += swaps;
+        }
+    }
+
+    /// New request (SQUID_DECODE_CACHE_ADAPT=...,reset): forget the session counts and return to the prior's
+    /// selection (the next ensure_decode_cache uploads it; called only before a batched prefill invalidates the cache).
+    fn reset_decode_cache_session(self: *Engine) void {
+        if (self.dcache_adapt_n == 0 or !self.dcache_adapt_reset) return;
+        const ne = constants.expert_count;
+        @memset(self.dcache_sess, 0);
+        @memcpy(self.dcache_sel, self.dcache_sel0);
+        @memset(self.dcache_cmap_h, -1);
+        const n: usize = self.dcache_n;
+        for (self.dcache_sel, 0..) |id, c| {
+            const k: usize = @as(usize, id >> 8) * ne + (id & 0xff);
+            self.dcache_cmap_h[k] = self.dcache_enc(c);
+            self.dcache_es_h[c] = self.dcache_les[k];
+            self.dcache_es_h[n + c] = self.dcache_les[constants.layer_count * ne + k];
+        }
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.dcache_cmap.?), @ptrCast(self.dcache_cmap_h.ptr), self.dcache_cmap_h.len * @sizeOf(i32), self.stream));
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.dcache_es.?), @ptrCast(self.dcache_es_h.ptr), 2 * n * @sizeOf(f32), self.stream));
+        self.dcache_valid = false;
+    }
+
+    /// Before B = 1 decode: (re)copy the decode bank / cache if a batched prefill chunk reused its space.
+    fn ensure_decode_bank(self: *Engine) void {
+        self.ensure_decode_cache();
+        if (self.dbank_layer < 0 or self.dbank_valid) return;
+        const t0: u64 = tiger.clock_monotonic_ns();
+        for (0..4) |k| {
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_default_async(self.dbank_dst[k].?, self.dbank_src[k].?, @intCast(self.dbank_bytes[k]), self.stream));
+        }
+        tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+        self.dbank_upload_ns += tiger.clock_monotonic_ns() - t0;
+        self.dbank_uploads += 1;
+        self.dbank_valid = true;
+    }
+
+    const score_tokens_max: usize = 65536;
+
+    // SQUID_SCORE_FORCE=<file of token ids> + SQUID_SCORE_OUT=<path>: teacher-forced scoring of the B = 1 decode
+    // path (no MTP). The token after the prompt and every decode step take the next forced token instead of the
+    // sampled one; each position records 5 x 4 bytes {forced id, argmax id, log p(forced), log p(argmax), top1 - top2
+    // logit}, written to SQUID_SCORE_OUT at the end of each generate. Needs --temp > 0: the LM head writes the full
+    // logits only when sampling (the sampled token itself is discarded).
+    fn init_score(self: *Engine) void {
+        const path = tiger.getenv("SQUID_SCORE_FORCE") orelse return;
+        if (tiger.getenv("SQUID_SCORE_OUT") == null) return;
+        self.score_force = tiger.alloc_host_zeroed(i32, score_tokens_max);
+        const n = cuda.cpu_moe_read_tokens(path, self.score_force.ptr, @intCast(score_tokens_max));
+        self.score_len = @intCast(@max(n, 0));
+        self.score_rec = tiger.alloc_host_zeroed(f32, score_tokens_max * 5);
+        self.score_logits = tiger.alloc_host_zeroed(f32, constants.vocab_unpadded_count);
+        tiger.print_stdout("[score] teacher-forcing {d} tokens\n", .{self.score_len});
+    }
+
+    // Records the position whose logits are at `logits_dev` (device, [vocab]) and returns the forced next token.
+    fn score_step(self: *Engine, logits_dev: [*]const f32) i32 {
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(self.score_logits.ptr), @ptrCast(logits_dev), constants.vocab_unpadded_count * @sizeOf(f32), self.stream));
+        tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+        const forced = self.score_force[self.score_n];
+        cuda.cpu_moe_score_logits(self.score_logits.ptr, @intCast(constants.vocab_unpadded_count), forced, self.score_rec[self.score_n * 5 ..].ptr);
+        self.score_n += 1;
+        return forced;
+    }
+
+    fn score_flush(self: *Engine) void {
+        if (self.score_n == 0) return;
+        const path = tiger.getenv("SQUID_SCORE_OUT").?;
+        const rc = cuda.cpu_moe_write_file(path, @ptrCast(self.score_rec.ptr), self.score_n * 5 * @sizeOf(f32));
+        tiger.print_stdout("[score] wrote {d} positions to {s} (rc {d})\n", .{ self.score_n, path, rc });
+    }
+
+    const trace_tokens_max: u32 = 32768;
+
+    fn init_route_trace(self: *Engine) void {
+        if (tiger.getenv("SQUID_ROUTE_TRACE") == null) return;
+        const bytes: usize = @as(usize, trace_tokens_max) * constants.visit_count * 8 * 4;
+        var h: ?*anyopaque = null;
+        tiger.assert_cuda(cuda.squid_cuda_malloc_host_pinned(&h, bytes, 1));
+        var d: ?*anyopaque = null;
+        tiger.assert_cuda(cuda.squid_cuda_host_get_device_pointer(&d, h.?));
+        var ctr: ?*anyopaque = null;
+        tiger.assert_cuda(cuda.squid_cuda_malloc(&ctr, 16));
+        tiger.assert_cuda(cuda.squid_cuda_memset_async(ctr.?, 0, 16, self.stream));
+        tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+        self.trace_host = h;
+        self.trace_dev = d;
+        self.trace_ctr = @ptrCast(@alignCast(ctr.?));
+        tiger.print_stdout("[trace] recording decode routing (up to {d} tokens)\n", .{trace_tokens_max});
+    }
+
+    fn deinit_route_trace(self: *Engine) void {
+        const h = self.trace_host orelse return;
+        const path = tiger.getenv("SQUID_ROUTE_TRACE").?;
+        tiger.assert_cuda(cuda.squid_cuda_device_sync());
+        var n: u32 = 0;
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h(@ptrCast(&n), @ptrCast(self.trace_ctr.?), 4));
+        n = @min(n, trace_tokens_max);
+        const row_bytes: usize = constants.visit_count * 8 * 4;
+        const out = std.heap.page_allocator.alloc(u8, 4 + @as(usize, n) * row_bytes) catch unreachable;
+        defer std.heap.page_allocator.free(out);
+        std.mem.writeInt(u32, out[0..4], n, .little);
+        @memcpy(out[4..], @as([*]const u8, @ptrCast(h))[0 .. @as(usize, n) * row_bytes]);
+        const rc = cuda.cpu_moe_write_file(path, @ptrCast(out.ptr), out.len);
+        tiger.print_stdout("[trace] wrote {d} tokens to {s} (rc {d})\n", .{ n, path, rc });
+        tiger.assert_cuda(cuda.squid_cuda_free(@ptrCast(self.trace_ctr.?)));
+        tiger.assert_cuda(cuda.squid_cuda_free_host(h));
+        self.trace_host = null;
+    }
+
+    fn init_cpu_moe(self: *Engine) void {
+        const w = self.weights.?;
+        if (w.host_expert_banks == 0 or w.pinned_host_experts == null) return;
+        const env = tiger.getenv("SQUID_CPU_MOE") orelse return;
+        if (env[0] != '1') return;
+        if (cuda.cpu_moe_available() == 0) {
+            tiger.print_stdout("[cpu-moe] needs AVX-512 F/BW/DQ/VBMI; CPU expert path off\n", .{});
+            return;
+        }
+        const host_base: [*]u8 = @ptrCast(w.pinned_host_experts.?);
+        const dev_base: usize = @intFromPtr(w.host_expert_dev.?);
+        var mask: u32 = 0;
+        var l: u32 = 0;
+        while (l < constants.layer_count) : (l += 1) {
+            const lw = &w.layers[l];
+            if (!weights_mod.bank_on_host(w.host_expert_banks, l, 0) or !weights_mod.bank_on_host(w.host_expert_banks, l, 1)) continue;
+            if (lw.w13.is_nvfp4 == 0 or lw.w2.is_nvfp4 == 0 or lw.w13.expert_scale == null or lw.w2.expert_scale == null) continue;
+            var es13: [constants.expert_count]f32 = undefined;
+            var es2: [constants.expert_count]f32 = undefined;
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h(@ptrCast(&es13), @ptrCast(lw.w13.expert_scale.?), @sizeOf(@TypeOf(es13))));
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h(@ptrCast(&es2), @ptrCast(lw.w2.expert_scale.?), @sizeOf(@TypeOf(es2))));
+            cuda.cpu_moe_set_layer(
+                @intCast(l),
+                host_base + (@intFromPtr(lw.w13.data.?) - dev_base),
+                host_base + (@intFromPtr(lw.w13.scales.?) - dev_base),
+                &es13,
+                host_base + (@intFromPtr(lw.w2.data.?) - dev_base),
+                host_base + (@intFromPtr(lw.w2.scales.?) - dev_base),
+                &es2,
+            );
+            mask |= @as(u32, 1) << @intCast(l);
+        }
+        if (mask == 0) return;
+
+        var sh_host: ?*anyopaque = null;
+        const sh_bytes: usize = cuda.cpu_moe_shared_bytes();
+        tiger.assert_cuda(cuda.squid_cuda_malloc_host_pinned(&sh_host, sh_bytes, 1));
+        @memset(@as([*]u8, @ptrCast(sh_host.?))[0..sh_bytes], 0);
+        var sh_dev: ?*anyopaque = null;
+        tiger.assert_cuda(cuda.squid_cuda_host_get_device_pointer(&sh_dev, sh_host.?));
+        var ctr: ?*anyopaque = null;
+        tiger.assert_cuda(cuda.squid_cuda_malloc(&ctr, 16));
+        tiger.assert_cuda(cuda.squid_cuda_memset_async(ctr.?, 0, 16, self.stream));
+        tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+
+        var n_threads: u32 = 8;
+        if (tiger.getenv("SQUID_CPU_MOE_THREADS")) |v| n_threads = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 8;
+        n_threads = @max(@as(u32, 1), @min(n_threads, 32));
+        // Thread i is pinned to CPU i (on this Zen 4 laptop CPUs 0-7 are distinct cores; 8-15 their SMT siblings).
+        // SQUID_CPU_MOE_PIN=0 leaves placement to the scheduler.
+        var cpus: [32]c_int = undefined;
+        const pin: bool = if (tiger.getenv("SQUID_CPU_MOE_PIN")) |v| v[0] != '0' else true;
+        for (&cpus, 0..) |*c, i| c.* = if (pin) @intCast(i) else -1;
+        tiger.assert(cuda.cpu_moe_start(sh_host.?, @intCast(n_threads), &cpus) == 0);
+        // SQUID_ENGINE_CPU=n pins the engine (CUDA-launching) thread to CPU n.
+        if (tiger.getenv("SQUID_ENGINE_CPU")) |v| {
+            const cpu = std.fmt.parseInt(i32, std.mem.span(v), 10) catch -1;
+            if (cpu >= 0) cuda.cpu_moe_pin_current_thread(cpu);
+        }
+
+        self.cpu_moe_layers = mask;
+        self.cpu_moe_sh_host = sh_host;
+        self.cpu_moe_sh_dev = sh_dev;
+        self.cpu_moe_ctr = @ptrCast(@alignCast(ctr.?));
+        tiger.print_stdout("[cpu-moe] on: {d} layers (mask 0x{x:0>6}) computed by {d} CPU threads{s}, kernel {s}\n", .{ @popCount(mask), mask, n_threads, if (pin) " (pinned)" else "", std.mem.span(cuda.cpu_moe_kernel_name()) });
+
+        if (tiger.getenv("SQUID_CPU_MOE_GPU_SLOTS")) |v| {
+            const n = std.fmt.parseInt(i32, std.mem.span(v), 10) catch 0;
+            self.cpu_moe_gpu_slots = @max(0, @min(n, 7));
+            if (self.cpu_moe_gpu_slots > 0) tiger.print_stdout("[cpu-moe] GPU + CPU split: the GPU computes top-k slots [0, {d}) of each CPU-served visit over PCIe\n", .{self.cpu_moe_gpu_slots});
+            if (tiger.getenv("SQUID_CPU_MOE_GPU_KSPLIT")) |kv| {
+                const k = std.fmt.parseInt(i32, std.mem.span(kv), 10) catch 0;
+                if (self.cpu_moe_gpu_slots > 0 and k > 0 and k < 1152 and @mod(k, 128) == 0) {
+                    self.cpu_moe_gpu_ksplit = k;
+                    tiger.print_stdout("[cpu-moe] ... plus intermediate rows [0, {d}) of slot {d} (the CPU does the rest of it)\n", .{ k, self.cpu_moe_gpu_slots });
+                }
+            }
+        }
+
+        if (tiger.getenv("SQUID_CPU_MOE_L2PF")) |v| {
+            const m = std.fmt.parseInt(i32, std.mem.span(v), 10) catch 0;
+            if (self.cpu_moe_gpu_slots > 0 and (m == 1 or m == 2)) {
+                self.cpu_moe_l2pf = m;
+                tiger.print_stdout("[cpu-moe] L2 prefetch of the next visit's dense weights during split visits (mode {d})\n", .{m});
+            }
+        }
+
+        if (tiger.getenv("SQUID_CPU_MOE_CHECK")) |v| {
+            if (v[0] == '1') self.check_cpu_moe();
+        }
+    }
+
+    /// SQUID_CPU_MOE_CHECK=1: run random inputs through both the GPU kernels and the CPU path for every
+    /// CPU-served layer and print how far apart they are.
+    // SQUID_CPU_MOE_L2PF: pull the NVFP4 QKVRG + o_proj weights of layer `nlw` into the GPU L2 (see kernels_cpumoe.cu).
+    /// gate != null: the kernel does nothing when gate[0] == 0 (a decode-cache visit with no CPU request).
+    fn launch_l2_prefetch_layer(self: *Engine, nlw: *const weights_mod.LayerWeights, gate: ?[*]const i32) void {
+        const lins = [_]*const cuda.CLinearWeight{ &nlw.w_qrgs, &nlw.w_k, &nlw.w_v, &nlw.w_o };
+        var ptrs: [8]?*const anyopaque = undefined;
+        var bytes: [8]u32 = undefined;
+        var n: usize = 0;
+        for (lins) |lin| {
+            if (lin.kind != @intFromEnum(constants.WeightKind.nvfp4) or lin.data == null or lin.scales == null) continue;
+            const rc: u64 = @as(u64, @intCast(lin.rows)) * @as(u64, @intCast(lin.cols));
+            ptrs[n] = lin.data;
+            bytes[n] = @intCast(rc / 2);
+            ptrs[n + 1] = @ptrCast(lin.scales);
+            bytes[n + 1] = @intCast(rc / 16);
+            n += 2;
+        }
+        if (n > 0) cuda.squid_launch_l2_prefetch_if(&ptrs, &bytes, @intCast(n), self.cpu_moe_l2pf, gate, self.stream);
+    }
+
+    fn check_cpu_moe(self: *Engine) void {
+        const w = self.weights.?;
+        var rng: u64 = 0x9e3779b97f4a7c15;
+        var worst_rel: f64 = 0.0;
+        var l: u32 = 0;
+        while (l < constants.layer_count) : (l += 1) {
+            if ((self.cpu_moe_layers >> @intCast(l)) & 1 == 0) continue;
+            var x16: [constants.hidden_dim]f16 = undefined;
+            for (&x16) |*xv| {
+                rng = rng *% 6364136223846793005 +% 1442695040888963407;
+                const u: f32 = @as(f32, @floatFromInt(@as(u32, @truncate(rng >> 40)))) / 16777216.0;
+                xv.* = @floatCast((u - 0.5) * 4.0);
+            }
+            var ids: [constants.top_k_experts]i32 = undefined;
+            var wts: [constants.top_k_experts]f32 = undefined;
+            for (&ids, &wts, 0..) |*id, *wt, k| {
+                id.* = @intCast((l * 7 + @as(u32, @intCast(k)) * 17 + 3) % constants.expert_count);
+                wt.* = 0.05 + 0.025 * @as(f32, @floatFromInt(k));
+            }
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(self.mlp_normed_h, @ptrCast(&x16), @sizeOf(@TypeOf(x16))));
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(@ptrCast(self.route_ids), @ptrCast(&ids), @sizeOf(@TypeOf(ids))));
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(@ptrCast(self.route_w), @ptrCast(&wts), @sizeOf(@TypeOf(wts))));
+            var y_gpu: [constants.hidden_dim]f32 = undefined;
+            var y_cpu: [constants.hidden_dim]f32 = undefined;
+            const lw = &w.layers[l];
+            cuda.squid_launch_moe_gate_up_h(&lw.w13, self.mlp_normed_h, self.route_ids, self.exp_groups, self.moe_act_h, 1, self.stream);
+            cuda.squid_launch_moe_down_h(&lw.w2, self.moe_act_h, self.route_ids, self.route_w, self.exp_groups, self.moe_down, 1, self.stream);
+            tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h(@ptrCast(&y_gpu), @ptrCast(self.moe_down), @sizeOf(@TypeOf(y_gpu))));
+            tiger.assert_cuda(cuda.squid_cuda_memset_async(@ptrCast(self.moe_down), 0, @sizeOf(@TypeOf(y_gpu)), self.stream));
+            cuda.cpu_moe_kick();
+            if (self.cpu_moe_gpu_slots > 0) {
+                cuda.squid_launch_cpu_moe_post(self.mlp_normed_h, self.route_ids, self.route_w, self.cpu_moe_sh_dev.?, self.cpu_moe_ctr.?, @intCast(l), self.cpu_moe_gpu_slots, self.cpu_moe_gpu_ksplit, self.stream);
+                cuda.squid_launch_moe_slots_h(&lw.w13, &lw.w2, self.mlp_normed_h, self.route_ids, self.route_w, self.moe_act_h, self.moe_down, self.cpu_moe_gpu_slots, self.cpu_moe_gpu_ksplit, self.stream);
+                cuda.squid_launch_cpu_moe_wait_add(self.cpu_moe_sh_dev.?, self.cpu_moe_ctr.?, self.moe_down, @ptrCast(self.cpu_moe_ctr.? + 1), self.stream);
+            } else {
+                cuda.squid_launch_cpu_moe_exchange(self.mlp_normed_h, self.route_ids, self.route_w, self.cpu_moe_sh_dev.?, self.cpu_moe_ctr.?, @intCast(l), self.moe_down, @ptrCast(self.cpu_moe_ctr.? + 1), self.stream);
+            }
+            tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h(@ptrCast(&y_cpu), @ptrCast(self.moe_down), @sizeOf(@TypeOf(y_cpu))));
+            var max_abs: f64 = 0.0;
+            var max_ref: f64 = 0.0;
+            var se: f64 = 0.0;
+            var sr: f64 = 0.0;
+            for (y_gpu, y_cpu) |a, b| {
+                const d: f64 = @abs(@as(f64, a) - @as(f64, b));
+                max_abs = @max(max_abs, d);
+                max_ref = @max(max_ref, @abs(@as(f64, a)));
+                se += d * d;
+                sr += @as(f64, a) * @as(f64, a);
+            }
+            const rel: f64 = @sqrt(se / @max(sr, 1e-30));
+            worst_rel = @max(worst_rel, rel);
+            tiger.print_stdout("[cpu-moe] check layer {d:>2}: rel L2 err {e:.3} | max abs diff {e:.3} (max |y| {d:.3})\n", .{ l, rel, max_abs, max_ref });
+        }
+        var flag: [2]u32 = undefined;
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h(@ptrCast(&flag), @ptrCast(self.cpu_moe_ctr.?), 8));
+        tiger.print_stdout("[cpu-moe] check done: worst rel L2 err {e:.3}, requests {d}, timeout flag {d}\n", .{ worst_rel, flag[0], flag[1] });
+    }
+
+    fn deinit_cpu_moe(self: *Engine) void {
+        if (self.cpu_moe_layers == 0) return;
+        cuda.cpu_moe_stop();
+        var req: u64 = 0;
+        var busy: u64 = 0;
+        var mx: u64 = 0;
+        cuda.cpu_moe_stats(&req, &busy, &mx);
+        if (req > 0) {
+            tiger.print_stdout("[cpu-moe] {d} visits, avg {d:.1} us, max {d:.1} us\n", .{ req, @as(f64, @floatFromInt(busy)) / @as(f64, @floatFromInt(req)) / 1000.0, @as(f64, @floatFromInt(mx)) / 1000.0 });
+        }
+        if (self.cpu_moe_ctr) |c| tiger.assert_cuda(cuda.squid_cuda_free(@ptrCast(c)));
+        if (self.cpu_moe_sh_host) |p| tiger.assert_cuda(cuda.squid_cuda_free_host(p));
+        self.cpu_moe_layers = 0;
     }
 
     pub fn deinit(self: *Engine) void {
+        if (self.dbank_uploads > 0) {
+            tiger.print_stdout("[dbank] {d} uploads of layer {d}'s experts, avg {d:.1} ms\n", .{ self.dbank_uploads, self.dbank_layer, @as(f64, @floatFromInt(self.dbank_upload_ns)) / @as(f64, @floatFromInt(self.dbank_uploads)) / 1e6 });
+        }
+        if (self.dcache_n > 0) {
+            if (self.dcache_uploads > 0) tiger.print_stdout("[dcache] {d} uploads of {d} experts, avg {d:.1} ms\n", .{ self.dcache_uploads, self.dcache_n, @as(f64, @floatFromInt(self.dcache_upload_ns)) / @as(f64, @floatFromInt(self.dcache_uploads)) / 1e6 });
+            if (self.dcache_adapt_steps > 0) tiger.print_stdout("[dcache] adaptive: {d} steps, {d} swaps ({d:.2} per step)\n", .{ self.dcache_adapt_steps, self.dcache_swaps, @as(f64, @floatFromInt(self.dcache_swaps)) / @as(f64, @floatFromInt(self.dcache_adapt_steps)) });
+            if (self.dcache_hist) |p| tiger.assert_cuda(cuda.squid_cuda_free(@ptrCast(p)));
+            const pa = std.heap.page_allocator;
+            pa.free(self.dcache_hist_last);
+            pa.free(self.dcache_prior);
+            pa.free(self.dcache_sess);
+            pa.free(self.dcache_cmap_h);
+            pa.free(self.dcache_es_h);
+            pa.free(self.dcache_les);
+            pa.free(self.dcache_sel0);
+            if (self.dcache_cmap) |p| tiger.assert_cuda(cuda.squid_cuda_free(@ptrCast(p)));
+            if (self.dcache_es) |p| tiger.assert_cuda(cuda.squid_cuda_free(@ptrCast(p)));
+            if (self.dcache_glist) |p| tiger.assert_cuda(cuda.squid_cuda_free(@ptrCast(p)));
+            std.heap.page_allocator.free(self.dcache_sel);
+            std.heap.page_allocator.free(self.dcache_loaded);
+            if (self.dcache_regb) |p| tiger.assert_cuda(cuda.squid_cuda_free(p));
+            self.dcache_n = 0;
+        }
+        self.deinit_route_trace();
+        self.deinit_cpu_moe();
         if (self.b1_graph_exec) |g| tiger.assert_cuda(cuda.squid_cuda_graph_destroy(g));
         for (&self.spec_graph_exec) |*g| {
             if (g.*) |exec| tiger.assert_cuda(cuda.squid_cuda_graph_destroy(exec));
@@ -827,6 +1676,7 @@ pub const Engine = struct {
         const num_drafts: u32 = if (num_drafts_in > constants.mtp_draft_count_max) constants.mtp_draft_count_max else num_drafts_in;
         const use_mtp: bool = (num_drafts > 0 and w.dspark.loaded != 0);
         const prompt_len: u32 = @intCast(prompt.len);
+        self.reset_decode_cache_session();
 
         // Upload per-request sampling config to device (zero CUDA graph rebuild!).
         const cfg_h: cuda.CSampleConfig = .{
@@ -965,6 +1815,10 @@ pub const Engine = struct {
         }
         stats.prefill_ms = @as(f64, @floatFromInt(tiger.clock_monotonic_ns() - prefill_start_ns)) / 1_000_000.0;
 
+        self.score_n = 0;
+        if (self.score_len > 0 and !use_mtp) {
+            first_tok = self.score_step(self.lm_logits + @as(usize, last_batch - 1) * constants.vocab_unpadded_count);
+        }
         if (out_tokens.len > 0) out_tokens[0] = first_tok;
         stats.generated_tokens = 1;
         stats.last_token_id = first_tok;
@@ -977,6 +1831,7 @@ pub const Engine = struct {
         const use_adaptive: bool = use_mtp and self.use_graphs and num_drafts == constants.mtp_draft_count_max and self.spec_threshold > 0.0;
         if (!use_mtp) {
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_tokens), @ptrCast(&first_tok), @sizeOf(i32), self.stream));
+            self.ensure_decode_bank();
             self.ensure_b1_graph();
         } else if (use_adaptive) {
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_anchor), @ptrCast(&first_tok), @sizeOf(i32), self.stream));
@@ -992,10 +1847,13 @@ pub const Engine = struct {
         const decode_start_ns: u64 = tiger.clock_monotonic_ns();
         if (!use_mtp) {
             while (stats.generated_tokens < max_new_tokens) {
+                if (self.cpu_moe_layers != 0) cuda.cpu_moe_kick();
                 if (self.use_graphs) {
                     tiger.assert_cuda(cuda.squid_cuda_graph_launch(self.b1_graph_exec.?, self.stream));
                 } else {
+                    self.dbank_use = self.dbank_layer >= 0 or self.dcache_n > 0;
                     self.record_target_forward(1, false, true);
+                    self.dbank_use = false;
                     cuda.squid_launch_inc_pos_and_copy_tok(self.d_pos, &self.d_tokens[0], &self.d_next_tokens[0], self.stream);
                 }
                 tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(self.h_accepted.?), @ptrCast(self.d_next_tokens), @sizeOf(i32), self.stream));
@@ -1005,17 +1863,25 @@ pub const Engine = struct {
                     self.prefix_cache.session_tokens[self.prefix_cache.session_len] = prev_fed_tok;
                     self.prefix_cache.session_len += 1;
                 }
-                const tok: i32 = self.h_accepted.?[0];
+                var tok: i32 = self.h_accepted.?[0];
+                if (self.score_n < self.score_len) {
+                    tok = self.score_step(self.lm_logits);
+                    tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_tokens), @ptrCast(&self.score_force[self.score_n - 1]), @sizeOf(i32), self.stream));
+                } else if (self.score_len > 0) {
+                    break;
+                }
                 prev_fed_tok = tok;
                 if (out_tokens.len > 0) out_tokens[stats.generated_tokens] = tok;
                 stats.generated_tokens += 1;
                 stats.last_token_id = tok;
                 self.current_position += 1;
+                if (self.dcache_adapt_n > 0 and stats.generated_tokens % self.dcache_adapt_n == 0) self.adapt_decode_cache();
                 if (on_token) |cb| {
                     if (!cb(callback_context.?, tok)) break;
                 }
                 if (tok == constants.eos_token_id) break;
             }
+            self.score_flush();
         } else if (use_adaptive) {
             // Hybrid O(1) Prompt-Lookup + Overlapped Adaptive {2, 4, 8} DSpark Speculative Decode!
             // Seed prompt-lookup ring with trailing prompt tokens + first_tok (<=8192 tok -> <25 us CPU).
@@ -1275,6 +2141,8 @@ pub const Engine = struct {
     /// while keeping sconv/attention/depth-norm/dspark_commit 100% exact via 8-token sub-slices.
     fn prefill_chunk_batched(self: *Engine, prompt: []const i32, start_i: u32, chunk_len: u32, commit_dspark: bool) void {
         tiger.assert(chunk_len >= 8 and chunk_len <= self.prefill_cap and (chunk_len % 8 == 0));
+        self.dbank_valid = false; // the prefill buffers hold the decode bank / cache between prefills
+        self.dcache_valid = false;
         const w = self.weights.?;
         const b_i32: i32 = @intCast(chunk_len);
         const b_usize: usize = chunk_len;
@@ -1875,10 +2743,14 @@ pub const Engine = struct {
         tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_anchor), @ptrCast(&seed_tok), @sizeOf(i32), self.stream));
         tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&sim_pos), @sizeOf(i32), self.stream));
 
-        if (!use_mtp) self.ensure_b1_graph() else self.ensure_spec_graph(num_drafts);
+        if (!use_mtp) {
+            self.ensure_decode_bank();
+            self.ensure_b1_graph();
+        } else self.ensure_spec_graph(num_drafts);
         tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
 
         const graph_exec = if (use_mtp) self.spec_graph_exec[num_drafts].? else self.b1_graph_exec.?;
+        if (self.cpu_moe_layers != 0) cuda.cpu_moe_kick();
         var warmup: u32 = 0;
         while (warmup < 4) : (warmup += 1) {
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&sim_pos), @sizeOf(i32), self.stream));
@@ -2292,8 +3164,29 @@ pub const Engine = struct {
                     self.stream,
                 );
             }
-            cuda.squid_launch_moe_gate_up_h(&lw.w13, self.mlp_normed_h, self.route_ids, self.exp_groups, self.moe_act_h, batch_size, self.stream);
-            cuda.squid_launch_moe_down_h(&lw.w2, self.moe_act_h, self.route_ids, self.route_w, self.exp_groups, self.moe_down, batch_size, self.stream);
+            if (batch_size == 1 and self.trace_dev != null) {
+                cuda.squid_launch_route_trace(self.route_ids, self.trace_dev.?, self.trace_ctr.?, @intCast(vi), constants.visit_count, trace_tokens_max, if (vi == constants.visit_count - 1) 1 else 0, self.stream);
+            }
+            const use_dbank: bool = batch_size == 1 and self.dbank_use and @as(i32, @intCast(l)) == self.dbank_layer;
+            const cpu_visit: bool = batch_size == 1 and (self.cpu_moe_layers >> @intCast(l)) & 1 == 1 and !use_dbank;
+            const use_dcache: bool = cpu_visit and self.dbank_use and (self.dcache_layers >> @intCast(l)) & 1 == 1;
+            if (use_dcache) {
+                const gl = self.dcache_glist.?;
+                cuda.squid_launch_cpu_moe_post_cache(self.mlp_normed_h, self.route_ids, self.route_w, self.cpu_moe_sh_dev.?, self.cpu_moe_ctr.?, @intCast(l), self.dcache_cmap.? + @as(usize, l) * constants.expert_count, gl, if (self.dcache_hist) |h| h + @as(usize, l) * constants.expert_count else null, self.dcache_pcie_h, self.stream);
+                cuda.squid_launch_moe_slots_list_h(&self.dcache_w13, &self.dcache_w2, &self.dcache_w13b, &self.dcache_w2b, &lw.w13, &lw.w2, self.mlp_normed_h, self.route_w, self.moe_act_h, self.moe_down, gl, self.stream);
+                if (self.cpu_moe_l2pf > 0 and vi + 1 < constants.visit_count) self.launch_l2_prefetch_layer(&w.layers[self.schedule[vi + 1].physical_layer], gl + 17);
+                cuda.squid_launch_cpu_moe_wait_add_if(self.cpu_moe_sh_dev.?, self.cpu_moe_ctr.?, self.moe_down, @ptrCast(self.cpu_moe_ctr.? + 1), gl + 17, self.stream);
+            } else if (cpu_visit and self.cpu_moe_gpu_slots > 0) {
+                cuda.squid_launch_cpu_moe_post(self.mlp_normed_h, self.route_ids, self.route_w, self.cpu_moe_sh_dev.?, self.cpu_moe_ctr.?, @intCast(l), self.cpu_moe_gpu_slots, self.cpu_moe_gpu_ksplit, self.stream);
+                cuda.squid_launch_moe_slots_h(&lw.w13, &lw.w2, self.mlp_normed_h, self.route_ids, self.route_w, self.moe_act_h, self.moe_down, self.cpu_moe_gpu_slots, self.cpu_moe_gpu_ksplit, self.stream);
+                if (self.cpu_moe_l2pf > 0 and vi + 1 < constants.visit_count) self.launch_l2_prefetch_layer(&w.layers[self.schedule[vi + 1].physical_layer], null);
+                cuda.squid_launch_cpu_moe_wait_add(self.cpu_moe_sh_dev.?, self.cpu_moe_ctr.?, self.moe_down, @ptrCast(self.cpu_moe_ctr.? + 1), self.stream);
+            } else if (cpu_visit) {
+                cuda.squid_launch_cpu_moe_exchange(self.mlp_normed_h, self.route_ids, self.route_w, self.cpu_moe_sh_dev.?, self.cpu_moe_ctr.?, @intCast(l), self.moe_down, @ptrCast(self.cpu_moe_ctr.? + 1), self.stream);
+            } else {
+                cuda.squid_launch_moe_gate_up_h(if (use_dbank) &self.dbank_w13 else &lw.w13, self.mlp_normed_h, self.route_ids, self.exp_groups, self.moe_act_h, batch_size, self.stream);
+                cuda.squid_launch_moe_down_h(if (use_dbank) &self.dbank_w2 else &lw.w2, self.moe_act_h, self.route_ids, self.route_w, self.exp_groups, self.moe_down, batch_size, self.stream);
+            }
             if (w.uncensor_dirs) |ud| cuda.squid_launch_dir_project(self.moe_down, ud + @as(usize, l) * constants.hidden_dim, batch_size, self.stream);
 
             if (vi == 17 or vi == 29) {
@@ -2412,7 +3305,9 @@ pub const Engine = struct {
     fn ensure_b1_graph(self: *Engine) void {
         if (self.b1_graph_exec != null or !self.use_graphs) return;
         tiger.assert_cuda(cuda.squid_cuda_graph_begin(self.stream));
+        self.dbank_use = self.dbank_layer >= 0 or self.dcache_n > 0;
         self.record_target_forward(1, false, true);
+        self.dbank_use = false;
         cuda.squid_launch_inc_pos_and_copy_tok(self.d_pos, &self.d_tokens[0], &self.d_next_tokens[0], self.stream);
         tiger.assert_cuda(cuda.squid_cuda_graph_end_instantiate(self.stream, &self.b1_graph_exec));
         tiger.assert(self.b1_graph_exec != null);
