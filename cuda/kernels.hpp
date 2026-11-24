@@ -103,11 +103,16 @@ void launch_moe_slots_h(
 // Decode expert cache (B = 1): up + down for the cached slots of a CPU-served visit, from the VRAM cache banks (expert
 // index = cache slot) listed by the post kernel in glist ([0] = n, [1 + j] = cache slot, [9 + j] = top-k slot).
 // An entry MOE_HOST_TAG | e reads expert e of the layer's host bank (w13h / w2h) over PCIe instead, and
-// MOE_BANK2_TAG | c slot c of the second (persistent) cache bank (w13b / w2b).
+// MOE_BANK2_TAG | c slot c of the second (persistent) cache bank (w13b / w2b), and MOE_TAIL_TAG | t tail slot t
+// (set_moe_tail_slots).
 void launch_moe_slots_list_h(
     const ExpertBank& w13, const ExpertBank& w2, const ExpertBank& w13b, const ExpertBank& w2b, const ExpertBank& w13h,
     const ExpertBank& w2h, const __half* x_h, const float* route_w, __half* act_h, float* out_down, const int32_t* glist,
     cudaStream_t stream);
+
+// Decode expert cache tail slots (MOE_TAIL_TAG | t): w13[t] / w2[t] = device address of slot t's w13 / w2 data (each
+// followed by its block scales); the slot's expert scale is the cache bank's expert_scale[wf_off + t]. Synchronous.
+cudaError_t set_moe_tail_slots(const void* const* w13, const void* const* w2, int n, int wf_off);
 
 // MoE Down + Weighted Top-K Reduction (reads half act!)
 void launch_moe_down_h(
@@ -367,6 +372,7 @@ void launch_mega_mlp_post_next_depth_norm(
     const float* abl_r,
     const float* abl_d,
     const float* abl_p,
+    const float* udir, // B = 1 only: uncensor direction, projected out of the input row before the conv (nullptr: none)
     cudaStream_t stream);
 
 // MEGA-FUSION 2: Local-layer fused k_sconv + v_sconv + Q/R/K clip + V norm + KV cache store (replaces 3 kernels!)
@@ -405,6 +411,7 @@ void launch_mega_attn_post_mlp_in(
     const float* abl_r,
     const float* abl_d,
     const float* abl_p,
+    const float* udir, // B = 1 only: uncensor direction, projected out of the input row before the conv (nullptr: none)
     cudaStream_t stream);
 
 // MEGA-FUSION 4: mlp_sconv + residual add -> hidden (supports deterministic 8-slot reduction when B>1!)
@@ -419,6 +426,7 @@ void launch_mega_mlp_post_res(
     const float* abl_r,
     const float* abl_d,
     const float* abl_p,
+    const float* udir, // B = 1 only: uncensor direction, projected out of the input row before the conv (nullptr: none)
     cudaStream_t stream);
 
 // Simple vector ops

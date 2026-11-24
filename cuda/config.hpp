@@ -94,9 +94,9 @@ struct SampleConfig {
     uint64_t seed;
 };
 
-constexpr int KV_SPLIT_K = 64;    // 8 KV heads x 64 bulk splits = 512 CTAs (3.0 blocks/SM!)
+constexpr int KV_SPLIT_K = 24;    // 8 KV heads x 24 bulk splits = 192 CTAs = 2 full waves at 4 CTAs/SM on the 24-SM RTX 4060 (64 splits = 5.33 waves: the 1/3 tail wave cost 6% of bulk time)
 constexpr int KV_LOCAL_SPLITS = 17; // 17 x 64 = 1088 >= 1024+8 (1 single tile per CTA!)
-constexpr int KV_TOTAL_SPLITS = KV_SPLIT_K + KV_LOCAL_SPLITS; // 81 slots in split_buf
+constexpr int KV_TOTAL_SPLITS = KV_SPLIT_K + KV_LOCAL_SPLITS; // 41 slots in split_buf
 constexpr int KV_Q4_GROUP = 64;  // 2 groups per 128-dim head
 constexpr int KV_Q4_GROUPS_PER_HEAD = HEAD_DIM / KV_Q4_GROUP; // 2
 constexpr int KV_Q4_SCALES_PER_TOK = NUM_KV_HEADS * KV_Q4_GROUPS_PER_HEAD; // 16

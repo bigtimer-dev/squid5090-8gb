@@ -684,7 +684,7 @@ global_attn_bulk_splitk_kernel(
 // Replaces slow scalar 48-visit attention (3,223 us -> ~450 us at pos >= 1024!).
 // ============================================================================
 template <int KV_FMT, int B_CONST>
-__global__ void __launch_bounds__((GQA_RATIO * B_CONST > 16) ? 256 : 128)
+__global__ void __launch_bounds__((GQA_RATIO * B_CONST > 16) ? 256 : 128, (GQA_RATIO * B_CONST > 16) ? 2 : 4)
 local_tail_attn_tc_kernel(
     const float* __restrict__ qrgs,
     const __nv_bfloat16* __restrict__ rel_proj,
@@ -747,6 +747,32 @@ local_tail_attn_tc_kernel(
         } red;
     } smem;
 
+    // 0. Issue the K and V tile loads first. They are decoded later with the arithmetic of load_kv_8elems_h2x4
+    //    (load_kv_8elems_raw + kv_raw_to_h2x4: bit-identical tiles). The V tile used to be requested only after
+    //    QK^T + softmax, a second DRAM round trip per CTA; now it arrives while QK^T runs.
+    //    The thread's rows are t_row0 + j * ROW_STEP; slot = (t0 + row) % kv_cap, stepped without a division each.
+    constexpr int KV_ITERS = 1024 / THREADS;   // 64 rows x 16 chunks of 8 elements per tile
+    constexpr int ROW_STEP = THREADS / 16;
+    const int t_row0 = tid >> 4;
+    const int sub = tid & 15;
+    KvRaw8<KV_FMT> k_raw[KV_ITERS], v_raw[KV_ITERS];
+    {
+        int slot = (t0 + t_row0) % kv_cap;
+        #pragma unroll
+        for (int j = 0; j < KV_ITERS; ++j) {
+            if (t_row0 + j * ROW_STEP < tile_len) k_raw[j] = load_kv_8elems_raw<KV_FMT>(k_cache, k_scale, slot, kvh, sub);
+            slot += ROW_STEP;
+            if (slot >= kv_cap) slot -= kv_cap;
+        }
+        slot = (t0 + t_row0) % kv_cap;
+        #pragma unroll
+        for (int j = 0; j < KV_ITERS; ++j) {
+            if (t_row0 + j * ROW_STEP < tile_len) v_raw[j] = load_kv_8elems_raw<KV_FMT>(v_cache, v_scale, slot, kvh, sub);
+            slot += ROW_STEP;
+            if (slot >= kv_cap) slot -= kv_cap;
+        }
+    }
+
     // 1. Load R[0..Q_CNT-1][0..15] into SMEM
     for (int i = tid; i < Q_CNT * D_REL; i += THREADS) {
         int qi = i >> 4;
@@ -756,29 +782,39 @@ local_tail_attn_tc_kernel(
         s_r[qi][k] = __float2half(qrgs[(size_t)b * QRGS_STRIDE + Q_DIM + h * D_REL + k]);
     }
 
-    // 2. Load relevant rel_proj columns [d_min .. d_max] transposed into s_rp[0..d_span-1][0..15]
+    // 2. Load relevant rel_proj columns [d_min .. d_max] transposed into s_rp[0..d_span-1][0..15].
+    //    A fixed unrolled trip count issues every load before the first store (the old loop waited on each load in
+    //    turn), and consecutive threads read consecutive distances of one rel_proj row (coalesced; rel_proj is
+    //    [D_REL][REL_EXTENT]). Same elements, same conversion.
     int d_min = max(0, pos0 - (t0 + tile_len - 1));
     int d_max = min(REL_EXTENT - 1, pos0 + B_CONST - 1 - t0);
     int d_span = (d_max >= d_min) ? (d_max - d_min + 1) : 0;
-    for (int i = tid; i < d_span * D_REL; i += THREADS) {
-        int di = i >> 4;
-        int k = i & 15;
-        int dist = d_min + di;
-        s_rp[di][k] = __float2half(__bfloat162float(__ldg(&rel_proj[k * REL_EXTENT + dist])));
+    {
+        constexpr int RP_ROWS = 63 + B_CONST;  // d_span <= tile_len + B_CONST - 1 <= 72 (the rows of s_rp)
+        constexpr int RP_ITERS = (RP_ROWS * D_REL + THREADS - 1) / THREADS;
+        __nv_bfloat16 rp_raw[RP_ITERS];
+        #pragma unroll
+        for (int j = 0; j < RP_ITERS; ++j) {
+            int i = tid + j * THREADS;
+            int k = i / RP_ROWS;
+            int di = i - k * RP_ROWS;
+            if (k < D_REL && di < d_span) rp_raw[j] = __ldg(&rel_proj[k * REL_EXTENT + d_min + di]);
+        }
+        #pragma unroll
+        for (int j = 0; j < RP_ITERS; ++j) {
+            int i = tid + j * THREADS;
+            int k = i / RP_ROWS;
+            int di = i - k * RP_ROWS;
+            if (k < D_REL && di < d_span) s_rp[di][k] = __float2half(__bfloat162float(rp_raw[j]));
+        }
     }
 
-    // 3. Load K tile into SMEM
+    // 3. K tile into SMEM
     #pragma unroll
-    for (int idx = tid; idx < 1024; idx += THREADS) {
-        int t_loc = idx >> 4;
-        int sub = idx & 15;
-        if (t_loc < tile_len) {
-            int slot = (t0 + t_loc) % kv_cap;
-            *reinterpret_cast<uint4*>(&smem.s_kv[t_loc][sub * 8]) =
-                load_kv_8elems_h2x4<KV_FMT>(k_cache, k_scale, slot, kvh, sub);
-        } else {
-            *reinterpret_cast<uint4*>(&smem.s_kv[t_loc][sub * 8]) = make_uint4(0, 0, 0, 0);
-        }
+    for (int j = 0; j < KV_ITERS; ++j) {
+        int t_loc = t_row0 + j * ROW_STEP;
+        *reinterpret_cast<uint4*>(&smem.s_kv[t_loc][sub * 8]) =
+            (t_loc < tile_len) ? kv_raw_to_h2x4<KV_FMT>(k_raw[j]) : make_uint4(0, 0, 0, 0);
     }
 
     // 4. Load Q[16, 128] * INV_SQRT_HEAD_DIM into registers
@@ -926,18 +962,12 @@ local_tail_attn_tc_kernel(
     }
     __syncthreads();
 
-    // 8. Load V tile into the SAME SMEM buffer!
+    // 8. V tile (requested at step 0) into the SAME SMEM buffer
     #pragma unroll
-    for (int idx = tid; idx < 1024; idx += THREADS) {
-        int t_loc = idx >> 4;
-        int sub = idx & 15;
-        if (t_loc < tile_len) {
-            int slot = (t0 + t_loc) % kv_cap;
-            *reinterpret_cast<uint4*>(&smem.s_kv[t_loc][sub * 8]) =
-                load_kv_8elems_h2x4<KV_FMT>(v_cache, v_scale, slot, kvh, sub);
-        } else {
-            *reinterpret_cast<uint4*>(&smem.s_kv[t_loc][sub * 8]) = make_uint4(0, 0, 0, 0);
-        }
+    for (int j = 0; j < KV_ITERS; ++j) {
+        int t_loc = t_row0 + j * ROW_STEP;
+        *reinterpret_cast<uint4*>(&smem.s_kv[t_loc][sub * 8]) =
+            (t_loc < tile_len) ? kv_raw_to_h2x4<KV_FMT>(v_raw[j]) : make_uint4(0, 0, 0, 0);
     }
     __syncthreads();
 
@@ -1800,12 +1830,13 @@ ctrl_split_up_kernel(MutPtr3 xs, CtrlNVFP4Ptr3 cws, BF16Ptr3 post_norms, MutPtr3
 }
 
 // Vectorized 4-channel short-conv helper (2x uint4 weight loads + float4 data loads!)
-__device__ __forceinline__ float4 sconv_apply_f4(
+// cur = row b of src, passed in (the fused uncensor projection changes it before the conv).
+__device__ __forceinline__ float4 sconv_apply_f4_cur(
+    float4 cur,
     const float* __restrict__ src,
     const __nv_bfloat16* __restrict__ sconv_w,
     float* __restrict__ ring,
     int b, int p, int c4, bool write_ring) {
-    float4 cur = *reinterpret_cast<const float4*>(src + (size_t)b * HIDDEN + c4);
     float4 z4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 t2 = (b >= 1) ? *reinterpret_cast<const float4*>(src + (size_t)(b - 1) * HIDDEN + c4)
                          : ((p >= 1) ? *reinterpret_cast<const float4*>(ring + (size_t)((p - 1) & 15) * HIDDEN + c4) : z4);
@@ -1830,6 +1861,15 @@ __device__ __forceinline__ float4 sconv_apply_f4(
     out.z = (fmaf(w2a.x, t0.z, fmaf(w2a.y, t1.z, fmaf(w2b.x, t2.z, w2b.y * cur.z))) + cur.z) * INV_SQRT_5;
     out.w = (fmaf(w3a.x, t0.w, fmaf(w3a.y, t1.w, fmaf(w3b.x, t2.w, w3b.y * cur.w))) + cur.w) * INV_SQRT_5;
     return out;
+}
+
+__device__ __forceinline__ float4 sconv_apply_f4(
+    const float* __restrict__ src,
+    const __nv_bfloat16* __restrict__ sconv_w,
+    float* __restrict__ ring,
+    int b, int p, int c4, bool write_ring) {
+    float4 cur = *reinterpret_cast<const float4*>(src + (size_t)b * HIDDEN + c4);
+    return sconv_apply_f4_cur(cur, src, sconv_w, ring, b, p, c4, write_ring);
 }
 
 __device__ __forceinline__ float f4_dot(float4 a, float4 b) {
@@ -1862,13 +1902,13 @@ __device__ __forceinline__ float4 load_moe_f4(const float* __restrict__ src, int
     return acc;
 }
 
-__device__ __forceinline__ float4 sconv_apply_f4_slotted(
+__device__ __forceinline__ float4 sconv_apply_f4_slotted_cur(
+    float4 cur,
     const float* __restrict__ src,
     bool is_slotted,
     const __nv_bfloat16* __restrict__ sconv_w,
     float* __restrict__ ring,
     int b, int p, int c4, bool write_ring) {
-    float4 cur = load_moe_f4(src, b, c4, is_slotted);
     float4 z4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 t2 = (b >= 1) ? load_moe_f4(src, b - 1, c4, is_slotted)
                          : ((p >= 1) ? *reinterpret_cast<const float4*>(ring + (size_t)((p - 1) & 15) * HIDDEN + c4) : z4);
@@ -1893,6 +1933,16 @@ __device__ __forceinline__ float4 sconv_apply_f4_slotted(
     out.z = (fmaf(w2a.x, t0.z, fmaf(w2a.y, t1.z, fmaf(w2b.x, t2.z, w2b.y * cur.z))) + cur.z) * INV_SQRT_5;
     out.w = (fmaf(w3a.x, t0.w, fmaf(w3a.y, t1.w, fmaf(w3b.x, t2.w, w3b.y * cur.w))) + cur.w) * INV_SQRT_5;
     return out;
+}
+
+__device__ __forceinline__ float4 sconv_apply_f4_slotted(
+    const float* __restrict__ src,
+    bool is_slotted,
+    const __nv_bfloat16* __restrict__ sconv_w,
+    float* __restrict__ ring,
+    int b, int p, int c4, bool write_ring) {
+    float4 cur = load_moe_f4(src, b, c4, is_slotted);
+    return sconv_apply_f4_slotted_cur(cur, src, is_slotted, sconv_w, ring, b, p, c4, write_ring);
 }
 
 // MEGA-FUSION 6: Global-layer dynamic k_sconv + v_sconv + Q/R/K clip + log-pos tau + V norm + KV store (BF16/FP8/Q4)!
@@ -2125,6 +2175,24 @@ mega_local_sconv_prep_store_kernel(
 
 // Runtime-gated directional ablation (adapted from satellitedown/inkling-2-mini-abliterated-ingine, Apache-2.0):
 // y <- y - w * max(r . y - offset, floor) * r   if (!abl_d || abl_d . y > threshold)
+// Uncensor projection fused into a 576-thread consumer (B = 1 decode): v <- v - dir * (dir . v) for the HIDDEN row this
+// block owns as one float4 per thread. Same arithmetic and reduction order as dir_project_kernel, so the fused path is
+// bit-identical to the separate kernel. Ends with a barrier: sm18 may be reused right after.
+__device__ __forceinline__ float4 dir_project_f4_576(
+    float4 v, const float* __restrict__ dir, int c4, int lane, int warp, float* sm18, float* s_dot) {
+    float4 d = __ldg(reinterpret_cast<const float4*>(dir + c4));
+    float part = warp_sum(f4_dot(v, d));
+    if (lane == 0) sm18[warp] = part;
+    __syncthreads();
+    if (warp == 0) {
+        float tot = warp_sum((lane < 18) ? sm18[lane] : 0.0f);
+        if (lane == 0) *s_dot = tot;
+    }
+    __syncthreads();
+    float k = *s_dot;
+    return make_float4(v.x - k * d.x, v.y - k * d.y, v.z - k * d.z, v.w - k * d.w);
+}
+
 __device__ __forceinline__ float4 apply_ablation_576(
     float4 y,
     const float* __restrict__ abl_r,
@@ -2176,7 +2244,8 @@ mega_attn_post_mlp_in_kernel(
     const int32_t* __restrict__ d_pos,
     const float* __restrict__ abl_r,
     const float* __restrict__ abl_d,
-    const float* __restrict__ abl_p) {
+    const float* __restrict__ abl_p,
+    const float* __restrict__ udir) {
     int b = blockIdx.x;
     int tid = threadIdx.x; // 0..575
     int lane = tid & 31;
@@ -2197,7 +2266,15 @@ mega_attn_post_mlp_in_kernel(
     float* blk_b = blocks + (size_t)b * 4 * HIDDEN;
 
     // 1. Vectorized attn_sconv + optional runtime-gated ablation + block copy/residual -> r_mp in registers!
-    float4 ao = sconv_apply_f4(o_proj, attn_sconv_w, attn_ring, b, p, c4, true);
+    float4 ao;
+    if (udir) {  // B = 1 only (for B > 1 the conv reads the other rows, which dir_project_kernel projects first)
+        __shared__ float s_udot;
+        float4 cur = *reinterpret_cast<const float4*>(o_proj + (size_t)b * HIDDEN + c4);
+        cur = dir_project_f4_576(cur, udir, c4, lane, warp, sm, &s_udot);
+        ao = sconv_apply_f4_cur(cur, o_proj, attn_sconv_w, attn_ring, b, p, c4, true);
+    } else {
+        ao = sconv_apply_f4(o_proj, attn_sconv_w, attn_ring, b, p, c4, true);
+    }
     ao = apply_ablation_576(ao, abl_r, abl_d, abl_p, c4, lane, warp, sm, sm_abl, &inv_rms);
     float4 rv;
     if (is_boundary) {
@@ -2301,7 +2378,8 @@ mega_mlp_post_res_kernel(
     const int32_t* __restrict__ d_pos,
     const float* __restrict__ abl_r,
     const float* __restrict__ abl_d,
-    const float* __restrict__ abl_p) {
+    const float* __restrict__ abl_p,
+    const float* __restrict__ udir) {
     int b = blockIdx.x;
     int tid = threadIdx.x;
     int lane = tid & 31;
@@ -2313,7 +2391,15 @@ mega_mlp_post_res_kernel(
     __shared__ float sm_r[18];
     __shared__ float sm_d[18];
     __shared__ float s_coeff;
-    float4 ff = sconv_apply_f4_slotted(moe_down_or_slots, moe_is_slotted, mlp_sconv_w, mlp_ring, b, p, c4, true);
+    float4 ff;
+    if (udir) {  // B = 1, not slotted
+        __shared__ float s_udot;
+        float4 cur = load_moe_f4(moe_down_or_slots, b, c4, moe_is_slotted);
+        cur = dir_project_f4_576(cur, udir, c4, lane, warp, sm_r, &s_udot);
+        ff = sconv_apply_f4_slotted_cur(cur, moe_down_or_slots, moe_is_slotted, mlp_sconv_w, mlp_ring, b, p, c4, true);
+    } else {
+        ff = sconv_apply_f4_slotted(moe_down_or_slots, moe_is_slotted, mlp_sconv_w, mlp_ring, b, p, c4, true);
+    }
     ff = apply_ablation_576(ff, abl_r, abl_d, abl_p, c4, lane, warp, sm_r, sm_d, &s_coeff);
     float4 res = *reinterpret_cast<const float4*>(residual + (size_t)b * HIDDEN + c4);
     *reinterpret_cast<float4*>(hidden_out + (size_t)b * HIDDEN + c4) =
@@ -2543,7 +2629,8 @@ mega_mlp_post_next_depth_norm_kernel(
     const int32_t* __restrict__ d_pos,
     const float* __restrict__ abl_r,
     const float* __restrict__ abl_d,
-    const float* __restrict__ abl_p) {
+    const float* __restrict__ abl_p,
+    const float* __restrict__ udir) {
     int b = blockIdx.x;
     int s = blockIdx.y;
     int tid = threadIdx.x; // 0..575
@@ -2561,7 +2648,15 @@ mega_mlp_post_next_depth_norm_kernel(
     __shared__ float inv_rms;
 
     // 1. Vectorized mlp_sconv (with deterministic 8-slot MoE sum when B>1!) + optional ablation + residual add -> hv in regs!
-    float4 ff = sconv_apply_f4_slotted(moe_down_or_slots, moe_is_slotted, prev_mlp_sconv_w, prev_mlp_ring, b, p, c4, s == 0);
+    float4 ff;
+    if (udir) {  // B = 1, not slotted; every blockIdx.y block projects its own copy (same values)
+        __shared__ float s_udot;
+        float4 cur = load_moe_f4(moe_down_or_slots, b, c4, moe_is_slotted);
+        cur = dir_project_f4_576(cur, udir, c4, lane, warp, sm, &s_udot);
+        ff = sconv_apply_f4_slotted_cur(cur, moe_down_or_slots, moe_is_slotted, prev_mlp_sconv_w, prev_mlp_ring, b, p, c4, s == 0);
+    } else {
+        ff = sconv_apply_f4_slotted(moe_down_or_slots, moe_is_slotted, prev_mlp_sconv_w, prev_mlp_ring, b, p, c4, s == 0);
+    }
     ff = apply_ablation_576(ff, abl_r, abl_d, abl_p, c4, lane, warp, sm, sm_abl, &inv_rms);
     float4 res = *reinterpret_cast<const float4*>(residual + (size_t)b * HIDDEN + c4);
     float4 hv = make_float4(res.x + ff.x, res.y + ff.y, res.z + ff.z, res.w + ff.w);
@@ -3039,14 +3134,14 @@ void launch_mega_mlp_post_next_depth_norm(
     const __nv_bfloat16* norm0, const __nv_bfloat16* norm1, const __nv_bfloat16* norm2,
     float* out0, float* out1, float* out2, __half* out_h0, __half* out_h1, __half* out_h2,
     int n_out, int B, const int32_t* d_pos,
-    const float* abl_r, const float* abl_d, const float* abl_p, cudaStream_t stream) {
+    const float* abl_r, const float* abl_d, const float* abl_p, const float* udir, cudaStream_t stream) {
     BF16Ptr3 np{{norm0, norm1, norm2}};
     MutPtr3 op{{out0, out1, out2}};
     HalfPtr3 ohp{{out_h0, out_h1, out_h2}};
     launch_pdl(mega_mlp_post_next_depth_norm_kernel, dim3(B, n_out), 576, stream,
         moe_down_or_slots, moe_is_slotted, prev_mlp_sconv_w, prev_mlp_ring, residual, hidden_out,
         pre_tap_out, post_tap_out, partial_out, blocks, n_blocks, queries, np, op, ohp, d_pos,
-        abl_r, abl_d, abl_p);
+        abl_r, abl_d, abl_p, udir);
 }
 
 void launch_mega_local_sconv_prep_store(
@@ -3065,19 +3160,19 @@ void launch_mega_attn_post_mlp_in(
     const float* hidden, const float* partial_prev, float* blocks, int block_count_before, bool is_boundary,
     float* residual_out, const float* mlp_query, const __nv_bfloat16* mlp_norm_w,
     float* mlp_out, __half* mlp_out_h, int B, const int32_t* d_pos,
-    const float* abl_r, const float* abl_d, const float* abl_p, cudaStream_t stream) {
+    const float* abl_r, const float* abl_d, const float* abl_p, const float* udir, cudaStream_t stream) {
     launch_pdl(mega_attn_post_mlp_in_kernel, dim3(B), 576, stream,
         o_proj, attn_sconv_w, attn_ring, hidden, partial_prev, blocks, block_count_before, is_boundary,
-        residual_out, mlp_query, mlp_norm_w, mlp_out, mlp_out_h, d_pos, abl_r, abl_d, abl_p);
+        residual_out, mlp_query, mlp_norm_w, mlp_out, mlp_out_h, d_pos, abl_r, abl_d, abl_p, udir);
 }
 
 void launch_mega_mlp_post_res(
     const float* moe_down_or_slots, bool moe_is_slotted, const __nv_bfloat16* mlp_sconv_w, float* mlp_ring,
     const float* residual, float* hidden_out, int B, const int32_t* d_pos,
-    const float* abl_r, const float* abl_d, const float* abl_p, cudaStream_t stream) {
+    const float* abl_r, const float* abl_d, const float* abl_p, const float* udir, cudaStream_t stream) {
     launch_pdl(mega_mlp_post_res_kernel, dim3(B), 576, stream,
         moe_down_or_slots, moe_is_slotted, mlp_sconv_w, mlp_ring, residual, hidden_out, d_pos,
-        abl_r, abl_d, abl_p);
+        abl_r, abl_d, abl_p, udir);
 }
 
 void launch_vec_add(const float* a, const float* b, float* out, int n, cudaStream_t stream) {

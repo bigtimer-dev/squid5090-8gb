@@ -213,7 +213,20 @@ pub const Engine = struct {
     dcache_regb: ?*anyopaque = null,
     dcache_w13b: cuda.CExpertBank = .{},
     dcache_w2b: cuda.CExpertBank = .{},
-    dcache_loaded: []u16 = &.{}, // expert held by each bank B slot ((layer << 8) | expert; 0xffff: none)
+    dcache_loaded: []u16 = &.{}, // expert held by each bank B / tail slot ((layer << 8) | expert; 0xffff: none)
+    // SQUID_DECODE_CACHE_TAIL=t: up to t more slots in the idle ends of the global K / V data arrays (sized for the full
+    // context, written only up to the current position). Slots [nab, n) live there (MOE_TAIL_TAG in kernels_gemv.cu),
+    // ordered by the first KV position each covers (non-increasing); [nab, nab + tail_on) are usable at the current KV
+    // extent. dcache_tail_guard switches slots off (expert back to the CPU, slot zeroed) before any KV write or read can
+    // reach them (+ margin); a new request switches the usable ones back on. SQUID_DECODE_CACHE_TAIL_CHECK=1 compares
+    // every live tail slot with its host copy after each request.
+    dcache_nab: u32 = 0,
+    dcache_tail_pos: []u32 = &.{},
+    dcache_tail_ptr: []usize = &.{},
+    dcache_tail_on: u32 = 0,
+    dcache_tail_margin: u32 = 0,
+    dcache_tail_evicts: u64 = 0,
+    dcache_tail_check: bool = false,
     dcache_valid: bool = false,
     dcache_layers: u32 = 0,
     dcache_w13: cuda.CExpertBank = .{},
@@ -778,12 +791,25 @@ pub const Engine = struct {
             }
         }
         self.dcache_na = @intCast(na);
+        // Tail slots: the next-ranked experts, in rank order (the slots switched off first as the context grows hold
+        // the least-used of them).
+        const nab: usize = n;
+        self.dcache_nab = @intCast(nab);
+        if (tiger.getenv("SQUID_DECODE_CACHE_TAIL")) |v| {
+            const want = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0;
+            if (want > 0 and w.dspark.loaded != 0) {
+                tiger.print_stdout("[dcache] tail slots need --mtp 0 (the drafter's decode path does not guard them); off\n", .{});
+            } else if (want > 0) {
+                n += self.dcache_tail_layout(per_expert, @min(want, nc - nab));
+            }
+            if (tiger.getenv("SQUID_DECODE_CACHE_TAIL_CHECK")) |cv| self.dcache_tail_check = cv[0] == '1';
+        }
         if (n == 0) {
             tiger.print_stdout("[dcache] no room ({d:.0} MiB); off\n", .{@as(f64, @floatFromInt(have)) / 1048576.0});
             return;
         }
-        // Cache slot order: by (layer, expert), so the uploads read host RAM in order.
-        std.sort.pdq(u32, cand[0..n], {}, std.sort.asc(u32));
+        // Cache slot order (banks A, B): by (layer, expert), so the uploads read host RAM in order.
+        std.sort.pdq(u32, cand[0..nab], {}, std.sort.asc(u32));
         self.dcache_sel = std.heap.page_allocator.alloc(u16, n) catch unreachable;
         var cmap: [constants.layer_count * constants.expert_count]i32 = @splat(-1);
         var es_h = std.heap.page_allocator.alloc(f32, 2 * n) catch unreachable;
@@ -822,6 +848,14 @@ pub const Engine = struct {
         @memcpy(self.dcache_es_h, es_h);
         self.dcache_sel0 = pa.alloc(u16, n) catch unreachable;
         @memcpy(self.dcache_sel0, self.dcache_sel);
+        self.dcache_tail_on = self.dcache_tail_count(0);
+        for (nab + self.dcache_tail_on..n) |c| {
+            const id = self.dcache_sel[c];
+            const k: usize = @as(usize, id >> 8) * ne + (id & 0xff);
+            cmap[k] = -1;
+            self.dcache_cmap_h[k] = -1;
+            self.dcache_sel[c] = 0xffff;
+        }
         self.dcache_prior = pa.alloc(f32, nn) catch unreachable;
         self.dcache_sess = pa.alloc(f32, nn) catch unreachable;
         self.dcache_hist_last = pa.alloc(u32, nn) catch unreachable;
@@ -901,12 +935,12 @@ pub const Engine = struct {
         self.dcache_w2.n_experts = @intCast(na);
         self.dcache_w13b = self.dcache_w13;
         self.dcache_w2b = self.dcache_w2;
-        if (n > na) {
-            self.dcache_w13b.n_experts = @intCast(n - na);
+        if (nab > na) {
+            self.dcache_w13b.n_experts = @intCast(nab - na);
             self.dcache_w13b.data = self.dcache_dstb[0];
             self.dcache_w13b.scales = self.dcache_dstb[1];
             self.dcache_w13b.expert_scale = self.dcache_es.? + na;
-            self.dcache_w2b.n_experts = @intCast(n - na);
+            self.dcache_w2b.n_experts = @intCast(nab - na);
             self.dcache_w2b.data = self.dcache_dstb[2];
             self.dcache_w2b.scales = self.dcache_dstb[3];
             self.dcache_w2b.expert_scale = self.dcache_es.? + n + na;
@@ -916,22 +950,29 @@ pub const Engine = struct {
         self.dcache_layers = layers;
         self.dcache_n = @intCast(n);
         self.dcache_valid = false;
-        tiger.print_stdout("[dcache] B = 1 decode: {d} experts of layers mask 0x{x:0>6} cached, {d} in the prefill buffers ({d:.0} of {d:.0} MiB) + {d} in bank B ({d:.0} MiB); prior covers {d:.1}% of their routing\n", .{ n, layers, na, @as(f64, @floatFromInt(off)) / 1048576.0, @as(f64, @floatFromInt(have)) / 1048576.0, n - na, @as(f64, @floatFromInt(per_expert * (n - na))) / 1048576.0, if (total_cnt > 0) 100.0 * @as(f64, @floatFromInt(covered)) / @as(f64, @floatFromInt(total_cnt)) else 0.0 });
+        tiger.print_stdout("[dcache] B = 1 decode: {d} experts of layers mask 0x{x:0>6} cached, {d} in the prefill buffers ({d:.0} of {d:.0} MiB) + {d} in bank B ({d:.0} MiB); + {d} in KV tails ({d} usable at once, margin {d} positions); prior covers {d:.1}% of their routing\n", .{ n, layers, na, @as(f64, @floatFromInt(off)) / 1048576.0, @as(f64, @floatFromInt(have)) / 1048576.0, nab - na, @as(f64, @floatFromInt(per_expert * (nab - na))) / 1048576.0, n - nab, self.dcache_tail_on, self.dcache_tail_margin, if (total_cnt > 0) 100.0 * @as(f64, @floatFromInt(covered)) / @as(f64, @floatFromInt(total_cnt)) else 0.0 });
     }
 
     /// Device address of array k (w13 data, w13 scales, w2 data, w2 scales) of cache slot c.
     fn dcache_slot_ptr(self: *const Engine, k: usize, c: usize) [*]u8 {
         const sz: usize = @intCast(self.dcache_esz[k]);
+        if (c >= self.dcache_nab) {
+            var off: usize = 0;
+            for (0..k) |i| off += @intCast(self.dcache_esz[i]);
+            return @ptrFromInt(self.dcache_tail_ptr[c - self.dcache_nab] + off);
+        }
         return if (c < self.dcache_na) self.dcache_dst[k].? + c * sz else self.dcache_dstb[k].? + (c - self.dcache_na) * sz;
     }
 
     /// cmap / glist entry of cache slot c (MOE_BANK2_TAG in kernels_gemv.cu marks bank B).
     fn dcache_enc(self: *const Engine, c: usize) i32 {
+        if (c >= self.dcache_nab) return @intCast((1 << 18) | (c - self.dcache_nab));
         return if (c < self.dcache_na) @intCast(c) else @intCast((1 << 17) | (c - self.dcache_na));
     }
 
     fn dcache_dec(self: *const Engine, v: i32) usize {
         const u: usize = @intCast(v);
+        if (u & (1 << 18) != 0) return self.dcache_nab + (u & 0xffff);
         return if (u & (1 << 17) != 0) self.dcache_na + (u & 0xffff) else u;
     }
 
@@ -940,6 +981,7 @@ pub const Engine = struct {
         const w = self.weights.?;
         const t0: u64 = tiger.clock_monotonic_ns();
         for (self.dcache_sel, 0..) |id, c| {
+            if (id == 0xffff) continue; // tail slot switched off
             if (c >= self.dcache_na) {
                 if (self.dcache_loaded[c - self.dcache_na] == id) continue;
                 self.dcache_loaded[c - self.dcache_na] = id;
@@ -1033,14 +1075,31 @@ pub const Engine = struct {
 
     /// New request (SQUID_DECODE_CACHE_ADAPT=...,reset): forget the session counts and return to the prior's
     /// selection (the next ensure_decode_cache uploads it; called only before a batched prefill invalidates the cache).
-    fn reset_decode_cache_session(self: *Engine) void {
-        if (self.dcache_adapt_n == 0 or !self.dcache_adapt_reset) return;
+    /// `hi`: KV positions [0, hi) may hold live KV or be written before decode (prompt, cached session): tail slots
+    /// that reach below hi + margin are switched off, the others usable again.
+    fn reset_decode_cache_session(self: *Engine, hi: u32) void {
+        if (self.dcache_n == 0) return;
+        self.dcache_tail_guard(hi);
+        const on = self.dcache_tail_count(hi);
+        if (self.dcache_adapt_n == 0 or !self.dcache_adapt_reset) {
+            if (on > self.dcache_tail_on) self.dcache_tail_refill(on);
+            return;
+        }
+        self.dcache_reset_selection(on);
+    }
+
+    /// Reset mode: the prior's selection with `on` tail slots in use (cmap / es rebuilt and queued; the next
+    /// ensure_decode_cache uploads whatever differs).
+    fn dcache_reset_selection(self: *Engine, on: u32) void {
         const ne = constants.expert_count;
         @memset(self.dcache_sess, 0);
         @memcpy(self.dcache_sel, self.dcache_sel0);
+        for (self.dcache_sel[self.dcache_nab + on ..]) |*x| x.* = 0xffff;
+        self.dcache_tail_on = on;
         @memset(self.dcache_cmap_h, -1);
         const n: usize = self.dcache_n;
         for (self.dcache_sel, 0..) |id, c| {
+            if (id == 0xffff) continue;
             const k: usize = @as(usize, id >> 8) * ne + (id & 0xff);
             self.dcache_cmap_h[k] = self.dcache_enc(c);
             self.dcache_es_h[c] = self.dcache_les[k];
@@ -1049,6 +1108,186 @@ pub const Engine = struct {
         tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.dcache_cmap.?), @ptrCast(self.dcache_cmap_h.ptr), self.dcache_cmap_h.len * @sizeOf(i32), self.stream));
         tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.dcache_es.?), @ptrCast(self.dcache_es_h.ptr), 2 * n * @sizeOf(f32), self.stream));
         self.dcache_valid = false;
+    }
+
+    /// End of a request's decode (reset mode): copy the prior's experts back into the persistent slots (bank B, the
+    /// live tail slots) that the adaptive cache swapped. The copies are queued on the stream without waiting: they run
+    /// while the server answers, and the next request's work queues behind them, so its upload is bank A only (was
+    /// bank A + every swapped persistent slot, ~+27 ms per request with 224 tail slots). The selection returns to
+    /// the prior now, as the next request's reset would; bank A stays stale until ensure_decode_cache, which every
+    /// decode path runs first (dcache_valid = false).
+    fn dcache_restore_persistent(self: *Engine) void {
+        if (self.dcache_n == 0 or self.dcache_adapt_n == 0 or !self.dcache_adapt_reset) return;
+        const w = self.weights.?;
+        const end: usize = self.dcache_nab + self.dcache_tail_on;
+        var queued: bool = false;
+        for (self.dcache_na..end) |c| {
+            const id = self.dcache_sel0[c];
+            if (id == 0xffff or self.dcache_loaded[c - self.dcache_na] == id) continue;
+            self.dcache_loaded[c - self.dcache_na] = id;
+            const lw = &w.layers[id >> 8];
+            const e: u64 = id & 0xff;
+            const srcs = [4]*const anyopaque{ @ptrCast(lw.w13.data.?), @ptrCast(lw.w13.scales.?), @ptrCast(lw.w2.data.?), @ptrCast(lw.w2.scales.?) };
+            for (0..4) |k| {
+                const sz = self.dcache_esz[k];
+                const src: [*]const u8 = @ptrCast(srcs[k]);
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_default_async(@ptrCast(self.dcache_slot_ptr(k, c)), @ptrCast(src + e * sz), @intCast(sz), self.stream));
+            }
+            queued = true;
+        }
+        // The device cmap / es must stop pointing at the restored slots' previous experts. The tail slots in use stay
+        // as they are: only the next request's reset knows which KV positions it keeps (a shielded side request
+        // keeps the session's, above its own position).
+        if (queued) self.dcache_reset_selection(self.dcache_tail_on);
+    }
+
+    /// Tail slots: whole experts (w13 data, w13 scales, w2 data, w2 scales back to back) at the ends of the global K / V
+    /// data arrays, ordered by the first KV position each covers, highest first. Also loads the kernels' slot table.
+    /// Returns the slot count (<= want).
+    fn dcache_tail_layout(self: *Engine, per_expert: u64, want: usize) usize {
+        const bpp: u64 = switch (self.kv_format) {
+            .bf16 => constants.kv_dim * 2,
+            .fp8 => constants.kv_dim,
+            .q4 => constants.kv_dim / 2,
+        };
+        const max_all = 1024;
+        var pos: [max_all]u32 = undefined;
+        var ptr: [max_all]usize = undefined;
+        var m: usize = 0;
+        var vi: u32 = 0;
+        while (vi < constants.visit_count) : (vi += 1) {
+            if (!self.schedule[vi].is_global) continue;
+            const bytes: u64 = @as(u64, @intCast(self.kv_cap[vi])) * bpp;
+            for ([2]?*anyopaque{ self.k_cache[vi], self.v_cache[vi] }) |arr| {
+                var j: u64 = 0;
+                while ((j + 1) * per_expert <= bytes and m < max_all and j < 64) : (j += 1) {
+                    const off = bytes - (j + 1) * per_expert;
+                    pos[m] = @intCast(off / bpp);
+                    ptr[m] = @intFromPtr(arr.?) + @as(usize, @intCast(off));
+                    m += 1;
+                }
+            }
+        }
+        var ord: [max_all]u16 = undefined;
+        for (0..m) |i| ord[i] = @intCast(i);
+        const Ctx = struct {
+            p: *const [max_all]u32,
+            fn gt(ctx: @This(), x: u16, y: u16) bool {
+                if (ctx.p[x] != ctx.p[y]) return ctx.p[x] > ctx.p[y];
+                return x < y;
+            }
+        };
+        std.sort.pdq(u16, ord[0..m], Ctx{ .p = &pos }, Ctx.gt);
+        const nt: usize = @min(@min(want, m), 256);
+        if (nt == 0) return 0;
+        const pa = std.heap.page_allocator;
+        self.dcache_tail_pos = pa.alloc(u32, nt) catch unreachable;
+        self.dcache_tail_ptr = pa.alloc(usize, nt) catch unreachable;
+        var up: [256]?*const anyopaque = @splat(null);
+        var dn: [256]?*const anyopaque = @splat(null);
+        const o2: usize = @intCast(self.dcache_esz[0] + self.dcache_esz[1]);
+        for (0..nt) |t| {
+            self.dcache_tail_pos[t] = pos[ord[t]];
+            self.dcache_tail_ptr[t] = ptr[ord[t]];
+            up[t] = @ptrFromInt(self.dcache_tail_ptr[t]);
+            dn[t] = @ptrFromInt(self.dcache_tail_ptr[t] + o2);
+        }
+        // Prefill chunks end at the prompt end (prefill_range / prefill_final_range clip them); B <= 8 forward passes and
+        // decode steps write and read at most a block past the current position.
+        self.dcache_tail_margin = 64;
+        tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+        tiger.assert_cuda(cuda.squid_set_moe_tail_slots(&up, &dn, @intCast(nt), @intCast(self.dcache_nab)));
+        return nt;
+    }
+
+    /// Tail slots usable when KV positions [0, hi) may be live or written.
+    fn dcache_tail_count(self: *const Engine, hi: u32) u32 {
+        const lim: u64 = @as(u64, hi) + self.dcache_tail_margin;
+        var t: u32 = 0;
+        while (t < self.dcache_tail_pos.len and self.dcache_tail_pos[t] >= lim) : (t += 1) {}
+        return t;
+    }
+
+    /// Before KV positions [0, hi) are written or read: switch off the tail slots the KV (+ margin) could reach. Their
+    /// experts go back to the CPU and the slot memory is zeroed (a stray read past the context end sees zeros, as
+    /// before). Queued on the stream ahead of the next forward pass.
+    fn dcache_tail_guard(self: *Engine, hi: u32) void {
+        const on = self.dcache_tail_count(hi);
+        if (on >= self.dcache_tail_on) return;
+        const ne = constants.expert_count;
+        const pe: usize = @intCast(self.dcache_esz[0] + self.dcache_esz[1] + self.dcache_esz[2] + self.dcache_esz[3]);
+        var t: u32 = on;
+        while (t < self.dcache_tail_on) : (t += 1) {
+            const c: usize = self.dcache_nab + t;
+            const id = self.dcache_sel[c];
+            if (id != 0xffff) {
+                self.dcache_cmap_h[@as(usize, id >> 8) * ne + (id & 0xff)] = -1;
+                self.dcache_sel[c] = 0xffff;
+            }
+            self.dcache_loaded[c - self.dcache_na] = 0xffff;
+            tiger.assert_cuda(cuda.squid_cuda_memset_async(@ptrFromInt(self.dcache_tail_ptr[t]), 0, pe, self.stream));
+            self.dcache_tail_evicts += 1;
+        }
+        self.dcache_tail_on = on;
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.dcache_cmap.?), @ptrCast(self.dcache_cmap_h.ptr), self.dcache_cmap_h.len * @sizeOf(i32), self.stream));
+    }
+
+    /// No per-request reset: tail slots [tail_on, on) are usable again; each takes its prior expert if that one is
+    /// not cached elsewhere (uploaded by the next ensure_decode_cache).
+    fn dcache_tail_refill(self: *Engine, on: u32) void {
+        const ne = constants.expert_count;
+        const nn = constants.layer_count * ne;
+        const n: usize = self.dcache_n;
+        var t: u32 = self.dcache_tail_on;
+        while (t < on) : (t += 1) {
+            const c: usize = self.dcache_nab + t;
+            const id = self.dcache_sel0[c];
+            const k: usize = @as(usize, id >> 8) * ne + (id & 0xff);
+            if (self.dcache_cmap_h[k] >= 0) continue;
+            self.dcache_sel[c] = id;
+            self.dcache_cmap_h[k] = self.dcache_enc(c);
+            self.dcache_es_h[c] = self.dcache_les[k];
+            self.dcache_es_h[n + c] = self.dcache_les[nn + k];
+        }
+        self.dcache_tail_on = on;
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.dcache_cmap.?), @ptrCast(self.dcache_cmap_h.ptr), self.dcache_cmap_h.len * @sizeOf(i32), self.stream));
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.dcache_es.?), @ptrCast(self.dcache_es_h.ptr), 2 * n * @sizeOf(f32), self.stream));
+        self.dcache_valid = false;
+    }
+
+    /// SQUID_DECODE_CACHE_TAIL_CHECK=1: compare every live tail slot with its expert's host copy (slow; for testing).
+    fn dcache_tail_verify(self: *Engine) void {
+        if (self.dcache_tail_pos.len == 0) return;
+        const w = self.weights.?;
+        tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+        const pa = std.heap.page_allocator;
+        const buf = pa.alloc(u8, @intCast(self.dcache_esz[0])) catch unreachable;
+        defer pa.free(buf);
+        var checked: u32 = 0;
+        var bad: u32 = 0;
+        var t: u32 = 0;
+        while (t < self.dcache_tail_on) : (t += 1) {
+            const c: usize = self.dcache_nab + t;
+            const id = self.dcache_sel[c];
+            if (id == 0xffff) continue;
+            checked += 1;
+            if (self.dcache_loaded[c - self.dcache_na] != id) {
+                bad += 1;
+                continue;
+            }
+            const lw = &w.layers[id >> 8];
+            const e: usize = id & 0xff;
+            const srcs = [4][*]const u8{ @ptrCast(lw.w13.data.?), @ptrCast(lw.w13.scales.?), @ptrCast(lw.w2.data.?), @ptrCast(lw.w2.scales.?) };
+            for (0..4) |k| {
+                const sz: usize = @intCast(self.dcache_esz[k]);
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h(@ptrCast(buf.ptr), @ptrCast(self.dcache_slot_ptr(k, c)), sz));
+                if (!std.mem.eql(u8, buf[0..sz], srcs[k][e * sz .. e * sz + sz])) {
+                    bad += 1;
+                    break;
+                }
+            }
+        }
+        tiger.print_stdout("[dcache] tail check at pos {d}: {d} of {d} live tail slots intact ({d} usable, {d} switched off so far)\n", .{ self.current_position, checked - bad, checked, self.dcache_tail_on, self.dcache_tail_evicts });
     }
 
     /// Before B = 1 decode: (re)copy the decode bank / cache if a batched prefill chunk reused its space.
@@ -1333,6 +1572,7 @@ pub const Engine = struct {
         if (self.dcache_n > 0) {
             if (self.dcache_uploads > 0) tiger.print_stdout("[dcache] {d} uploads of {d} experts, avg {d:.1} ms\n", .{ self.dcache_uploads, self.dcache_n, @as(f64, @floatFromInt(self.dcache_upload_ns)) / @as(f64, @floatFromInt(self.dcache_uploads)) / 1e6 });
             if (self.dcache_adapt_steps > 0) tiger.print_stdout("[dcache] adaptive: {d} steps, {d} swaps ({d:.2} per step)\n", .{ self.dcache_adapt_steps, self.dcache_swaps, @as(f64, @floatFromInt(self.dcache_swaps)) / @as(f64, @floatFromInt(self.dcache_adapt_steps)) });
+            if (self.dcache_tail_pos.len > 0) tiger.print_stdout("[dcache] tail slots: {d}, {d} usable at exit, switched off {d} times\n", .{ self.dcache_tail_pos.len, self.dcache_tail_on, self.dcache_tail_evicts });
             if (self.dcache_hist) |p| tiger.assert_cuda(cuda.squid_cuda_free(@ptrCast(p)));
             const pa = std.heap.page_allocator;
             pa.free(self.dcache_hist_last);
@@ -1347,6 +1587,10 @@ pub const Engine = struct {
             if (self.dcache_glist) |p| tiger.assert_cuda(cuda.squid_cuda_free(@ptrCast(p)));
             std.heap.page_allocator.free(self.dcache_sel);
             std.heap.page_allocator.free(self.dcache_loaded);
+            if (self.dcache_tail_pos.len > 0) {
+                pa.free(self.dcache_tail_pos);
+                pa.free(self.dcache_tail_ptr);
+            }
             if (self.dcache_regb) |p| tiger.assert_cuda(cuda.squid_cuda_free(p));
             self.dcache_n = 0;
         }
@@ -1676,7 +1920,7 @@ pub const Engine = struct {
         const num_drafts: u32 = if (num_drafts_in > constants.mtp_draft_count_max) constants.mtp_draft_count_max else num_drafts_in;
         const use_mtp: bool = (num_drafts > 0 and w.dspark.loaded != 0);
         const prompt_len: u32 = @intCast(prompt.len);
-        self.reset_decode_cache_session();
+        self.reset_decode_cache_session(@max(prompt_len, self.prefix_cache.session_len));
 
         // Upload per-request sampling config to device (zero CUDA graph rebuild!).
         const cfg_h: cuda.CSampleConfig = .{
@@ -1847,6 +2091,10 @@ pub const Engine = struct {
         const decode_start_ns: u64 = tiger.clock_monotonic_ns();
         if (!use_mtp) {
             while (stats.generated_tokens < max_new_tokens) {
+                if (self.dcache_tail_on > 0) {
+                    const cp: u32 = @intCast(self.current_position);
+                    if (@as(u64, cp) + 1 + self.dcache_tail_margin > self.dcache_tail_pos[self.dcache_tail_on - 1]) self.dcache_tail_guard(cp + 1);
+                }
                 if (self.cpu_moe_layers != 0) cuda.cpu_moe_kick();
                 if (self.use_graphs) {
                     tiger.assert_cuda(cuda.squid_cuda_graph_launch(self.b1_graph_exec.?, self.stream));
@@ -1882,6 +2130,7 @@ pub const Engine = struct {
                 if (tok == constants.eos_token_id) break;
             }
             self.score_flush();
+            if (self.dcache_tail_check) self.dcache_tail_verify();
         } else if (use_adaptive) {
             // Hybrid O(1) Prompt-Lookup + Overlapped Adaptive {2, 4, 8} DSpark Speculative Decode!
             // Seed prompt-lookup ring with trailing prompt tokens + first_tok (<=8192 tok -> <25 us CPU).
@@ -2055,6 +2304,7 @@ pub const Engine = struct {
                 self.save_local_state_checkpoint(3, self.prefix_cache.session_len);
             }
         }
+        self.dcache_restore_persistent(); // queued behind the checkpoint copies; runs while the answer goes out
         return stats;
     }
 
@@ -2697,6 +2947,12 @@ pub const Engine = struct {
         if (sim_pos > max_allowed) sim_pos = tiger.max_i32(0, max_allowed);
 
         self.reset();
+        if (self.dcache_tail_pos.len > 0) {
+            // decode at sim_pos (+ iterations); the memset below also clears the tail slots: re-upload the usable ones
+            self.reset_decode_cache_session(@as(u32, @intCast(sim_pos)) + iterations + 8);
+            for (0..self.dcache_tail_pos.len) |t| self.dcache_loaded[self.dcache_nab + t - self.dcache_na] = 0xffff;
+            self.dcache_valid = false;
+        }
 
         // Zero-init global KV caches so synthetic reads are strictly finite (zero NaN)
         var vi: u32 = 0;
@@ -2828,6 +3084,7 @@ pub const Engine = struct {
         var block_count: i32 = 0;
         var has_prior: bool = false;
         var prev_mlp_pending: bool = false;
+        var mlp_udir: ?[*]const f32 = null; // B = 1: uncensor direction of the pending moe_down, fused into its consumer
 
         var vi: u32 = 0;
         while (vi < constants.visit_count) : (vi += 1) {
@@ -2931,9 +3188,11 @@ pub const Engine = struct {
                     prev_abl.r,
                     prev_abl.d,
                     prev_abl.p,
+                    mlp_udir,
                     self.stream,
                 );
                 prev_mlp_pending = false;
+                mlp_udir = null;
             } else {
                 cuda.squid_launch_fused_depth_norm(
                     self.hidden,
@@ -3097,7 +3356,11 @@ pub const Engine = struct {
             } else {
                 cuda.squid_launch_linear(&lw.w_o, self.attn_gated, self.o_proj, batch_size, 0, self.stream);
             }
-            if (w.uncensor_dirs) |ud| cuda.squid_launch_dir_project(self.o_proj, ud + @as(usize, l) * constants.hidden_dim, batch_size, self.stream);
+            var attn_udir: ?[*]const f32 = null; // B = 1: fused into mega_attn_post_mlp_in
+            if (w.uncensor_dirs) |ud| {
+                const dir = ud + @as(usize, l) * constants.hidden_dim;
+                if (batch_size == 1) attn_udir = dir else cuda.squid_launch_dir_project(self.o_proj, dir, batch_size, self.stream);
+            }
 
             const is_boundary: bool = (l % constants.block_layer_count == 0);
             const attn_abl = ablation_slice(w, false, vi);
@@ -3120,6 +3383,7 @@ pub const Engine = struct {
                 attn_abl.r,
                 attn_abl.d,
                 attn_abl.p,
+                attn_udir,
                 self.stream,
             );
             if (is_boundary) block_count += 1;
@@ -3187,7 +3451,10 @@ pub const Engine = struct {
                 cuda.squid_launch_moe_gate_up_h(if (use_dbank) &self.dbank_w13 else &lw.w13, self.mlp_normed_h, self.route_ids, self.exp_groups, self.moe_act_h, batch_size, self.stream);
                 cuda.squid_launch_moe_down_h(if (use_dbank) &self.dbank_w2 else &lw.w2, self.moe_act_h, self.route_ids, self.route_w, self.exp_groups, self.moe_down, batch_size, self.stream);
             }
-            if (w.uncensor_dirs) |ud| cuda.squid_launch_dir_project(self.moe_down, ud + @as(usize, l) * constants.hidden_dim, batch_size, self.stream);
+            if (w.uncensor_dirs) |ud| {
+                const dir = ud + @as(usize, l) * constants.hidden_dim;
+                if (batch_size == 1) mlp_udir = dir else cuda.squid_launch_dir_project(self.moe_down, dir, batch_size, self.stream);
+            }
 
             if (vi == 17 or vi == 29) {
                 const mlp_abl = ablation_slice(w, true, vi);
@@ -3203,9 +3470,11 @@ pub const Engine = struct {
                     mlp_abl.r,
                     mlp_abl.d,
                     mlp_abl.p,
+                    mlp_udir,
                     self.stream,
                 );
                 prev_mlp_pending = false;
+                mlp_udir = null;
             } else {
                 prev_mlp_pending = true;
             }
@@ -3241,6 +3510,7 @@ pub const Engine = struct {
             last_mlp_abl.r,
             last_mlp_abl.d,
             last_mlp_abl.p,
+            mlp_udir,
             self.stream,
         );
 

@@ -1359,6 +1359,12 @@ constexpr int MOE_MAXM = 8;
 constexpr int MOE_HOST_TAG = 1 << 16;   // decode expert cache list: entry = MOE_HOST_TAG | e -> expert e of the host bank
 constexpr int MOE_BANK2_TAG = 1 << 17;  // MOE_BANK2_TAG | c -> slot c of the second (persistent) cache bank (wb, wsb, wfb)
 constexpr int MOE_IDX_MASK = MOE_HOST_TAG - 1;
+constexpr int MOE_TAIL_TAG = 1 << 18;   // MOE_TAIL_TAG | t -> tail slot t: one whole expert in the idle tail of a global KV array
+constexpr int MOE_TAIL_MAX = 256;
+// Tail slot bases (set_moe_tail_slots): c_moe_tail[0][t] = the slot's w13 data (its scales follow it), [1][t] = its w2
+// data (scales follow). Expert scale of slot t: wfactor[c_moe_tail_wf_off + t] (tail slots follow banks A and B there).
+__constant__ const uint8_t* c_moe_tail[2][MOE_TAIL_MAX];
+__constant__ int c_moe_tail_wf_off;
 constexpr int MOE_UP_WARPS = HIDDEN / 128;         // 18 warps (576 threads)
 constexpr int MOE_DOWN_GROUPS = INTERMEDIATE / 128; // 9 column groups
 constexpr int MOE_DOWN_PAR = 2;                     // 2 experts per round
@@ -1577,8 +1583,19 @@ moe_up_tc_persist_kernel(
         e_out = e;
         mask_out = (__ffs(mask) - 1 == slot) ? mask : 0u;  // 0: a repeated expert, done by its first slot
         const bool hst = (e & MOE_HOST_TAG) != 0, b2 = (e & MOE_BANK2_TAG) != 0;
-        const size_t row = (size_t)(e & MOE_IDX_MASK) * R + tile * MOE_TILE + g;
-        moe_load_w<FMT, K>(f, (hst ? wh : b2 ? wb : w) + row * CB, (hst ? wsh : b2 ? wsb : ws) + row * SB, 4 * warp + t);
+        const uint8_t* pw;
+        const uint8_t* ps;
+        if (e & MOE_TAIL_TAG) {
+            const uint8_t* tb = c_moe_tail[0][e & MOE_IDX_MASK];
+            const size_t r = (size_t)tile * MOE_TILE + g;
+            pw = tb + r * CB;
+            ps = tb + (size_t)R * CB + r * SB;
+        } else {
+            const size_t row = (size_t)(e & MOE_IDX_MASK) * R + tile * MOE_TILE + g;
+            pw = (hst ? wh : b2 ? wb : w) + row * CB;
+            ps = (hst ? wsh : b2 ? wsb : ws) + row * SB;
+        }
+        moe_load_w<FMT, K>(f, pw, ps, 4 * warp + t);
         moe_load_x<FMT>(f, (g == 0) ? x_h : nullptr, 4 * warp + t);
     };
 
@@ -1611,7 +1628,7 @@ moe_up_tc_persist_kernel(
                 #pragma unroll
                 for (int v = 0; v < 4; ++v) s[v] += red[ww][lane][v];
             }
-            float es = (FMT == 0) ? ((e & MOE_HOST_TAG) ? wfh : (e & MOE_BANK2_TAG) ? wfb : wfactor)[e & MOE_IDX_MASK] : 1.0f;
+            float es = (FMT == 0) ? ((e & MOE_HOST_TAG) ? wfh : (e & MOE_BANK2_TAG) ? wfb : wfactor)[(e & MOE_IDX_MASK) + ((e & MOE_TAIL_TAG) ? c_moe_tail_wf_off : 0)] : 1.0f;
             tile_out[g][2 * t]         = s[0] * es;
             tile_out[g][2 * t + 1]     = s[1] * es;
             tile_out[g + 8][2 * t]     = s[2] * es;
@@ -1844,8 +1861,19 @@ moe_down_tc_persist_kernel(
         if (skip(u)) return;
         const int e = uexp[u];
         const bool hst = (e & MOE_HOST_TAG) != 0, b2 = (e & MOE_BANK2_TAG) != 0;
-        const size_t row = (size_t)(e & MOE_IDX_MASK) * R + tl * MOE_TILE + g;
-        moe_load_w<FMT, K>(f, (hst ? wh : b2 ? wb : w) + row * CB, (hst ? wsh : b2 ? wsb : ws) + row * SB, c);
+        const uint8_t* pw;
+        const uint8_t* ps;
+        if (e & MOE_TAIL_TAG) {
+            const uint8_t* tb = c_moe_tail[1][e & MOE_IDX_MASK];
+            const size_t r = (size_t)tl * MOE_TILE + g;
+            pw = tb + r * CB;
+            ps = tb + (size_t)R * CB + r * SB;
+        } else {
+            const size_t row = (size_t)(e & MOE_IDX_MASK) * R + tl * MOE_TILE + g;
+            pw = (hst ? wh : b2 ? wb : w) + row * CB;
+            ps = (hst ? wsh : b2 ? wsb : ws) + row * SB;
+        }
+        moe_load_w<FMT, K>(f, pw, ps, c);
     };
     auto load_x_u = [&](int u, MoeFrag<FMT>& f) {
         if (!skip(u)) moe_load_x<FMT>(f, xrow(u), c);
@@ -1886,7 +1914,7 @@ moe_down_tc_persist_kernel(
                     for (int v = 0; v < 4; ++v) sacc[v] += part[pp * MOE_DOWN_GROUPS + j][lane][v];
                 }
                 const int ue = uexp[base + pp];
-                const float es = (FMT == 0) ? ((ue & MOE_HOST_TAG) ? wfh : (ue & MOE_BANK2_TAG) ? wfb : wfactor)[ue & MOE_IDX_MASK] : 1.0f;
+                const float es = (FMT == 0) ? ((ue & MOE_HOST_TAG) ? wfh : (ue & MOE_BANK2_TAG) ? wfb : wfactor)[(ue & MOE_IDX_MASK) + ((ue & MOE_TAIL_TAG) ? c_moe_tail_wf_off : 0)] : 1.0f;
                 float (&y)[MOE_TILE][MOE_MAXM] = ybuf[base + pp];
                 y[g][2 * t]         = sacc[0] * es;
                 y[g][2 * t + 1]     = sacc[1] * es;
@@ -2128,6 +2156,19 @@ void launch_moe_slots_list_h(
         static_cast<const __half*>(act_h), glist + 1, route_w, w2.data, w2.scales, w2.expert_scale, out_down, 0, 0, glist,
         static_cast<const uint8_t*>(w2h.data), static_cast<const uint8_t*>(w2h.scales), static_cast<const float*>(w2h.expert_scale),
         static_cast<const uint8_t*>(w2b.data), static_cast<const uint8_t*>(w2b.scales), static_cast<const float*>(w2b.expert_scale));
+}
+
+
+cudaError_t set_moe_tail_slots(const void* const* w13, const void* const* w2, int n, int wf_off) {
+    if (n < 0 || n > MOE_TAIL_MAX) return cudaErrorInvalidValue;
+    const uint8_t* tbl[2][MOE_TAIL_MAX] = {};
+    for (int i = 0; i < n; ++i) {
+        tbl[0][i] = static_cast<const uint8_t*>(w13[i]);
+        tbl[1][i] = static_cast<const uint8_t*>(w2[i]);
+    }
+    cudaError_t e = cudaMemcpyToSymbol(c_moe_tail, tbl, sizeof(tbl));
+    if (e != cudaSuccess) return e;
+    return cudaMemcpyToSymbol(c_moe_tail_wf_off, &wf_off, sizeof(int));
 }
 
 void launch_moe_down_h(

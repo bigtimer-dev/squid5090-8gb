@@ -707,12 +707,12 @@ void squid_launch_mega_attn_post_mlp_in(
     const float* o_proj, const void* attn_sw, float* attn_ring, const float* hidden, const float* partial_prev,
     float* blocks, int32_t block_count_before, uint8_t is_boundary, float* residual_out, const float* mlp_query,
     const void* mlp_norm_w, float* mlp_out, void* mlp_out_h, int32_t B, const int32_t* d_pos,
-    const float* abl_r, const float* abl_d, const float* abl_p, void* stream) {
+    const float* abl_r, const float* abl_d, const float* abl_p, const float* udir, void* stream) {
     launch_mega_attn_post_mlp_in(
         o_proj, static_cast<const __nv_bfloat16*>(attn_sw), attn_ring, hidden, partial_prev,
         blocks, block_count_before, is_boundary != 0, residual_out, mlp_query,
         static_cast<const __nv_bfloat16*>(mlp_norm_w), mlp_out, static_cast<__half*>(mlp_out_h),
-        B, d_pos, abl_r, abl_d, abl_p, static_cast<cudaStream_t>(stream));
+        B, d_pos, abl_r, abl_d, abl_p, udir, static_cast<cudaStream_t>(stream));
 }
 
 void squid_launch_route_topk_nvfp4(
@@ -751,6 +751,10 @@ void squid_launch_moe_slots_h(
                        static_cast<__half*>(act_h), out_down, kslots, k_split, static_cast<cudaStream_t>(stream));
 }
 
+int squid_set_moe_tail_slots(const void* const* w13, const void* const* w2, int n, int wf_off) {
+    return static_cast<int>(set_moe_tail_slots(w13, w2, n, wf_off));
+}
+
 void squid_launch_moe_slots_list_h(
     const CExpertBank* w13, const CExpertBank* w2, const CExpertBank* w13b, const CExpertBank* w2b,
     const CExpertBank* w13h, const CExpertBank* w2h, const void* x_h, const float* route_w, void* act_h,
@@ -763,10 +767,10 @@ void squid_launch_moe_slots_list_h(
 void squid_launch_mega_mlp_post_res(
     const float* moe_down_or_slots, uint8_t moe_is_slotted, const void* mlp_sw, float* mlp_ring,
     const float* residual, float* hidden_out, int32_t B, const int32_t* d_pos,
-    const float* abl_r, const float* abl_d, const float* abl_p, void* stream) {
+    const float* abl_r, const float* abl_d, const float* abl_p, const float* udir, void* stream) {
     launch_mega_mlp_post_res(
         moe_down_or_slots, moe_is_slotted != 0, static_cast<const __nv_bfloat16*>(mlp_sw),
-        mlp_ring, residual, hidden_out, B, d_pos, abl_r, abl_d, abl_p, static_cast<cudaStream_t>(stream));
+        mlp_ring, residual, hidden_out, B, d_pos, abl_r, abl_d, abl_p, udir, static_cast<cudaStream_t>(stream));
 }
 
 void squid_launch_mega_mlp_post_next_depth_norm(
@@ -776,14 +780,14 @@ void squid_launch_mega_mlp_post_next_depth_norm(
     const void* n0, const void* n1, const void* n2,
     float* o0, float* o1, float* o2, void* oh0, void* oh1, void* oh2,
     int32_t n_out, int32_t B, const int32_t* d_pos,
-    const float* abl_r, const float* abl_d, const float* abl_p, void* stream) {
+    const float* abl_r, const float* abl_d, const float* abl_p, const float* udir, void* stream) {
     launch_mega_mlp_post_next_depth_norm(
         moe_down_or_slots, moe_is_slotted != 0, static_cast<const __nv_bfloat16*>(prev_mlp_sw),
         prev_mlp_ring, residual, hidden_out, pre_tap_out, post_tap_out, partial_out,
         blocks, n_blocks, queries,
         static_cast<const __nv_bfloat16*>(n0), static_cast<const __nv_bfloat16*>(n1), static_cast<const __nv_bfloat16*>(n2),
         o0, o1, o2, static_cast<__half*>(oh0), static_cast<__half*>(oh1), static_cast<__half*>(oh2),
-        n_out, B, d_pos, abl_r, abl_d, abl_p, static_cast<cudaStream_t>(stream));
+        n_out, B, d_pos, abl_r, abl_d, abl_p, udir, static_cast<cudaStream_t>(stream));
 }
 
 void squid_launch_lm_head_argmax(
