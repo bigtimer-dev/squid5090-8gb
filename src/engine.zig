@@ -121,6 +121,20 @@ const prefill_batch_max: u32 = 2048;
 const prefill_local_attn_sub: u32 = 256;
 const prefill_sub_chunks_max: u32 = prefill_batch_max / constants.mtp_block_size_max; // 256
 
+/// Runtime prefill chunk cap: SQUID_PREFILL_CHUNK (multiple of 8, 32..prefill_batch_max), default prefill_batch_max.
+/// Smaller chunks shrink the prefill arena (~0.33 MiB/token) to leave VRAM for expert banks on small GPUs.
+pub fn prefill_chunk_tokens() u32 {
+    const env = tiger.getenv("SQUID_PREFILL_CHUNK") orelse return prefill_batch_max;
+    const v = std.fmt.parseInt(u32, std.mem.span(env), 10) catch return prefill_batch_max;
+    return @min(prefill_batch_max, @max(@as(u32, 32), v & ~@as(u32, 7)));
+}
+
+/// VRAM the runtime arena will need (same formula Engine.init uses), so the weight loader can size its expert budget.
+pub fn estimate_runtime_vram_bytes(context_tokens_max: u32, kv_format: constants.KVFormat, has_dspark: bool) u64 {
+    const schedule = constants.build_visit_schedule();
+    return compute_runtime_vram_bytes(&schedule, context_tokens_max, kv_format, has_dspark, cuda.squid_sizeof_expert_groups(), prefill_chunk_tokens());
+}
+
 inline fn offset_f16_ptr(base: *anyopaque, elem_offset: usize) *anyopaque {
     const bytes: [*]u8 = @ptrCast(base);
     return @ptrCast(bytes + elem_offset * 2);
@@ -146,6 +160,7 @@ const PrefixCache = struct {
 pub const Engine = struct {
     weights: ?*const weights_mod.ModelWeights = null,
     context_tokens_max: u32 = 0,
+    prefill_cap: u32 = prefill_batch_max,
     use_graphs: bool = true,
     kv_format: constants.KVFormat = .fp8,
     current_position: i32 = 0,
@@ -302,6 +317,7 @@ pub const Engine = struct {
         self.use_graphs = use_graphs;
         self.kv_format = kv_format;
         self.schedule = constants.build_visit_schedule();
+        self.prefill_cap = prefill_chunk_tokens();
 
         tiger.assert_cuda(cuda.squid_cuda_stream_create(&self.stream));
         tiger.assert_cuda(cuda.squid_cuda_stream_create(&self.aux_stream));
@@ -320,6 +336,7 @@ pub const Engine = struct {
             kv_format,
             has_dspark,
             expert_groups_bytes,
+            self.prefill_cap,
         );
         self.arena = vram_arena.VRAMArena.init(runtime_bytes);
 
@@ -426,8 +443,8 @@ pub const Engine = struct {
         const zero_cfg: cuda.CSampleConfig = .{};
         tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_sample_cfg), @ptrCast(&zero_cfg), @sizeOf(cuda.CSampleConfig), self.stream));
 
-        // Fast batched prefill arena (B <= 256)
-        const pb: u64 = prefill_batch_max;
+        // Fast batched prefill arena (B <= prefill_cap)
+        const pb: u64 = self.prefill_cap;
         self.p_tokens = self.arena.alloc_many(i32, pb);
         self.p_pos_vec = self.arena.alloc_many(i32, prefill_sub_chunks_max);
         self.p_hidden = self.arena.alloc_many(f32, pb * constants.hidden_dim);
@@ -1168,7 +1185,7 @@ pub const Engine = struct {
         // Fast batched Tensor Core + multi-token MoE prefill (chunks of 32..256, multiples of 8)
         while (end_i - i >= 32 and (!compute_last_lm or end_i - i > 32)) {
             const avail: u32 = if (compute_last_lm) (end_i - i - 1) else (end_i - i);
-            const chunk: u32 = @min(prefill_batch_max, avail & ~@as(u32, 7));
+            const chunk: u32 = @min(self.prefill_cap, avail & ~@as(u32, 7));
             if (chunk < 32) break;
             self.prefill_chunk_batched(prompt, i, chunk, use_mtp);
             i += chunk;
@@ -1206,7 +1223,7 @@ pub const Engine = struct {
         // Fast batched Tensor Core + multi-token MoE prefill leaving 1..31 tokens for final lm_head chunk
         while (prompt_len - i > 32) {
             const avail: u32 = prompt_len - i - 1;
-            const chunk: u32 = @min(prefill_batch_max, avail & ~@as(u32, 7));
+            const chunk: u32 = @min(self.prefill_cap, avail & ~@as(u32, 7));
             if (chunk < 32) break;
             self.prefill_chunk_batched(prompt, i, chunk, use_mtp);
             i += chunk;
@@ -1244,7 +1261,7 @@ pub const Engine = struct {
     /// Uses cuBLAS FP16 Tensor Cores for dense/router GEMMs and multi-token half2 MoE kernels,
     /// while keeping sconv/attention/depth-norm/dspark_commit 100% exact via 8-token sub-slices.
     fn prefill_chunk_batched(self: *Engine, prompt: []const i32, start_i: u32, chunk_len: u32, commit_dspark: bool) void {
-        tiger.assert(chunk_len >= 8 and chunk_len <= prefill_batch_max and (chunk_len % 8 == 0));
+        tiger.assert(chunk_len >= 8 and chunk_len <= self.prefill_cap and (chunk_len % 8 == 0));
         const w = self.weights.?;
         const b_i32: i32 = @intCast(chunk_len);
         const b_usize: usize = chunk_len;
@@ -1543,6 +1560,7 @@ pub const Engine = struct {
 
             // 4. BATCHED cuBLAS FP16 Tensor Core O Projection (B = chunk_len!)
             cuda.squid_launch_prefill_gemm_h(&lw.w_o, self.p_attn_gated_h, self.p_o_proj, self.p_w_f16, b_i32, self.stream);
+            if (w.uncensor_dirs) |ud| cuda.squid_launch_dir_project(self.p_o_proj, ud + @as(usize, l) * constants.hidden_dim, b_i32, self.stream);
             if (prof_on) {
                 tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
                 const now = tiger.clock_monotonic_ns();
@@ -1667,6 +1685,7 @@ pub const Engine = struct {
                 b_i32,
                 self.stream,
             );
+            if (w.uncensor_dirs) |ud| cuda.squid_launch_dir_project(self.p_moe_slot_out, ud + @as(usize, l) * constants.hidden_dim, b_i32 * @as(i32, constants.top_k_experts), self.stream);
             if (prof_on) {
                 tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
                 const now = tiger.clock_monotonic_ns();
@@ -2193,6 +2212,7 @@ pub const Engine = struct {
             } else {
                 cuda.squid_launch_linear(&lw.w_o, self.attn_gated, self.o_proj, batch_size, 0, self.stream);
             }
+            if (w.uncensor_dirs) |ud| cuda.squid_launch_dir_project(self.o_proj, ud + @as(usize, l) * constants.hidden_dim, batch_size, self.stream);
 
             const is_boundary: bool = (l % constants.block_layer_count == 0);
             const attn_abl = ablation_slice(w, false, vi);
@@ -2261,6 +2281,7 @@ pub const Engine = struct {
             }
             cuda.squid_launch_moe_gate_up_h(&lw.w13, self.mlp_normed_h, self.route_ids, self.exp_groups, self.moe_act_h, batch_size, self.stream);
             cuda.squid_launch_moe_down_h(&lw.w2, self.moe_act_h, self.route_ids, self.route_w, self.exp_groups, self.moe_down, batch_size, self.stream);
+            if (w.uncensor_dirs) |ud| cuda.squid_launch_dir_project(self.moe_down, ud + @as(usize, l) * constants.hidden_dim, batch_size, self.stream);
 
             if (vi == 17 or vi == 29) {
                 const mlp_abl = ablation_slice(w, true, vi);
@@ -2512,6 +2533,7 @@ fn compute_runtime_vram_bytes(
     kv_format: constants.KVFormat,
     has_dspark: bool,
     expert_groups_bytes: u64,
+    prefill_cap: u32,
 ) u64 {
     const a = constants.vram_alignment_bytes;
     var total: u64 = 0;
@@ -2583,8 +2605,8 @@ fn compute_runtime_vram_bytes(
     total += tiger.align_up_u64(b * constants.vocab_unpadded_count * 4, a); // lm_logits
     total += tiger.align_up_u64(@sizeOf(cuda.CSampleConfig), a); // d_sample_cfg
 
-    // Fast batched prefill arena (B <= 512)
-    const pb: u64 = prefill_batch_max;
+    // Fast batched prefill arena (B <= prefill_cap)
+    const pb: u64 = prefill_cap;
     total += tiger.align_up_u64(pb * 4, a); // p_tokens
     total += tiger.align_up_u64(prefill_sub_chunks_max * 4, a); // p_pos_vec
     total += 3 * tiger.align_up_u64(pb * constants.hidden_dim * 4, a); // p_hidden, p_prelude, p_partial

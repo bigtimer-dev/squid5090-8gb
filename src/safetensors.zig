@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const tiger = @import("tiger.zig");
+const cuda = @import("cuda.zig");
 
 pub const tensor_count_max: u32 = 2048;
 pub const hash_slot_count: u32 = 4096;
@@ -27,6 +28,10 @@ pub const TensorInfo = struct {
 
 pub const SafetensorsFile = struct {
     file_descriptor: i32 = -1,
+    // Big-tensor fast path: O_DIRECT fd + 64 MiB pinned bounce buffer (large sequential reads instead of
+    // 128 KB mmap fault readahead, which crawls through dm-crypt). Only set up for files > 256 MiB.
+    direct_fd: i32 = -1,
+    bounce: ?[*]u8 = null,
     mapped_ptr: ?[*]const u8 = null,
     file_bytes: u64 = 0,
     data_base_offset: u64 = 0,
@@ -72,7 +77,84 @@ pub const SafetensorsFile = struct {
 
         self.parse_header(base[8 .. 8 + @as(usize, @intCast(header_len))]);
         tiger.assert(self.tensor_count > 0);
+
+        if (file_bytes > 256 * 1024 * 1024) {
+            const dfd: i32 = tiger.open(path_z, tiger.O_RDONLY | tiger.O_DIRECT);
+            if (dfd >= 0) {
+                var b: ?*anyopaque = null;
+                if (cuda.squid_cuda_malloc_host_pinned(&b, bounce_bytes, 0) == 0 and b != null) {
+                    self.direct_fd = dfd;
+                    self.bounce = @ptrCast(b.?);
+                } else {
+                    _ = tiger.close(dfd);
+                }
+            }
+        }
         return true;
+    }
+
+    const bounce_bytes: usize = 64 * 1024 * 1024;
+    const dio_align: u64 = 4096;
+    const chunk_bytes_max: u64 = bounce_bytes - 2 * dio_align;
+
+    /// Read [file_off, file_off + n) through O_DIRECT into the pinned bounce buffer; returns exactly those bytes.
+    fn read_chunk(self: *const SafetensorsFile, file_off: u64, n: u64) []const u8 {
+        tiger.assert(n > 0 and n <= chunk_bytes_max);
+        const a0: u64 = file_off & ~(dio_align - 1);
+        const end: u64 = file_off + n;
+        const a1: u64 = tiger.align_up_u64(end, dio_align);
+        const span: usize = @intCast(a1 - a0);
+        const buf: [*]u8 = self.bounce.?;
+        var got: usize = 0;
+        while (got < span) {
+            const r: isize = tiger.pread(self.direct_fd, buf + got, span - got, @intCast(a0 + got));
+            if (r <= 0) break; // short read only at EOF (last partial block)
+            got += @intCast(r);
+        }
+        tiger.assert(a0 + got >= end);
+        const skip: usize = @intCast(file_off - a0);
+        return buf[skip .. skip + @as(usize, @intCast(n))];
+    }
+
+    /// Copy the first `len` bytes of a tensor into host memory.
+    pub fn copy_to_host(self: *const SafetensorsFile, info: *const TensorInfo, dst: [*]u8, len: u64) void {
+        tiger.assert(len <= info.byte_length);
+        if (self.bounce == null) {
+            @memcpy(dst[0..@intCast(len)], self.data_slice(info)[0..@intCast(len)]);
+            return;
+        }
+        const start: u64 = self.data_base_offset + info.data_offset;
+        var done: u64 = 0;
+        while (done < len) {
+            const n: u64 = @min(len - done, chunk_bytes_max);
+            const src = self.read_chunk(start + done, n);
+            @memcpy(dst[@intCast(done)..][0..@intCast(n)], src);
+            done += n;
+        }
+    }
+
+    /// Copy the first `len` bytes of a tensor into device memory (DMA from the pinned bounce buffer).
+    pub fn copy_to_device(self: *const SafetensorsFile, info: *const TensorInfo, dst_dev: *anyopaque, len: u64) void {
+        self.copy_range_to_device(info, 0, len, dst_dev);
+    }
+
+    /// Copy tensor bytes [rel, rel + len) into device memory.
+    pub fn copy_range_to_device(self: *const SafetensorsFile, info: *const TensorInfo, rel: u64, len: u64, dst_dev: *anyopaque) void {
+        tiger.assert(len > 0 and rel + len <= info.byte_length);
+        if (self.bounce == null) {
+            const src: [*]const u8 = @ptrCast(self.data_ptr(info));
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(dst_dev, @ptrCast(src + @as(usize, @intCast(rel))), @intCast(len)));
+            return;
+        }
+        const start: u64 = self.data_base_offset + info.data_offset + rel;
+        const dst: [*]u8 = @ptrCast(dst_dev);
+        var done: u64 = 0;
+        while (done < len) {
+            const n: u64 = @min(len - done, chunk_bytes_max);
+            const src = self.read_chunk(start + done, n);
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(@ptrCast(dst + @as(usize, @intCast(done))), @ptrCast(src.ptr), @intCast(n)));
+            done += n;
+        }
     }
 
     pub fn close_file(self: *SafetensorsFile) void {
@@ -84,6 +166,14 @@ pub const SafetensorsFile = struct {
         if (self.file_descriptor >= 0) {
             _ = tiger.close(self.file_descriptor);
             self.file_descriptor = -1;
+        }
+        if (self.direct_fd >= 0) {
+            _ = tiger.close(self.direct_fd);
+            self.direct_fd = -1;
+        }
+        if (self.bounce) |b| {
+            _ = cuda.squid_cuda_free_host(@ptrCast(b));
+            self.bounce = null;
         }
         self.file_bytes = 0;
         self.tensor_count = 0;

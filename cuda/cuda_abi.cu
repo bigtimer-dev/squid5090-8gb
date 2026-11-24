@@ -396,8 +396,15 @@ static DsparkWeights to_dw(const CDsparkWeights& c) {
 
 int32_t squid_cuda_malloc(void** ptr, size_t bytes) { return (int32_t)cudaMalloc(ptr, bytes); }
 int32_t squid_cuda_free(void* ptr) { return (int32_t)cudaFree(ptr); }
+// mapped: bit0 = cudaHostAllocMapped (zero-copy device pointer), bit1 = cudaHostAllocWriteCombined.
 int32_t squid_cuda_malloc_host_pinned(void** ptr, size_t bytes, uint8_t mapped) {
-    return (int32_t)cudaHostAlloc(ptr, bytes, mapped ? cudaHostAllocMapped : cudaHostAllocDefault);
+    unsigned int flags = cudaHostAllocDefault;
+    if (mapped & 1u) flags |= cudaHostAllocMapped;
+    if (mapped & 2u) flags |= cudaHostAllocWriteCombined;
+    return (int32_t)cudaHostAlloc(ptr, bytes, flags);
+}
+int32_t squid_cuda_mem_get_info(size_t* free_bytes, size_t* total_bytes) {
+    return (int32_t)cudaMemGetInfo(free_bytes, total_bytes);
 }
 int32_t squid_cuda_free_host(void* ptr) { return (int32_t)cudaFreeHost(ptr); }
 int32_t squid_cuda_host_get_device_pointer(void** dev_ptr, void* host_ptr) {
@@ -525,6 +532,9 @@ void squid_launch_embed_norm(const void* embed, const void* embed_norm, const in
                       tokens, out, B, static_cast<cudaStream_t>(stream));
 }
 
+void squid_launch_dir_project(float* y, const float* dir, int32_t n_vecs, void* stream) {
+    launch_dir_project(y, dir, n_vecs, static_cast<cudaStream_t>(stream));
+}
 void squid_launch_rmsnorm(const float* x, const void* weight, float* out, int32_t B, int32_t width, int32_t group_size, float eps, void* stream) {
     launch_rmsnorm(x, static_cast<const __nv_bfloat16*>(weight), out, B, width, group_size, eps, static_cast<cudaStream_t>(stream));
 }

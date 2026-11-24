@@ -1,3 +1,64 @@
+# squid5090-8gb
+
+**A fork of [`tensorfish/squid5090`](https://github.com/tensorfish/squid5090) (based on `3ee093c`) that runs Inkling-2-Mini on an 8 GB GPU.** Tested on an RTX 4060 Laptop GPU (`sm_89`, 8 GB VRAM, PCIe 4.0 x8) with 30 GB of RAM. Upstream's README follows below, unchanged.
+
+## What this fork changes
+
+- **Experts that don't fit in VRAM are read from host RAM.** Upstream keeps every weight in VRAM (15.6 GiB at 8K context). Here, the expert banks beyond the VRAM budget go into one mapped, pinned host buffer that the GPU reads zero-copy over PCIe. VRAM goes to the looped core layers first, because layers 6–17 run three times per token. If everything fits, nothing moves.
+- **`--uncensor PATH` applies the [AtomicChat uncensored LoRA](https://huggingface.co/AtomicChat/Inkling-2-Mini-Uncensored-GGUF) exactly.** That rank-1 LoRA is a projection removal, `y -= b·(b·y)`, on the attention output and on every expert's down projection, plus an edit to the embedding table. A new kernel applies the projection before the short conv. Upstream's `--ablation` hook runs after the conv, so it can't reproduce the LoRA. [`tools/uncensor-lora/`](tools/uncensor-lora/) checks the equivalence on the real weights and bakes the embedding edit into a reflinked copy of the checkpoint.
+- **Loads in 16–18 s instead of ~2.5–3 min.** Layers 20–23 ship as MXFP8 and are converted to NVFP4 at load. For banks bound for host RAM, the conversion now runs in VRAM staging and the result is copied to the host by DMA; storing straight into mapped host memory ran at ~12 MB/s. Large safetensors files are read with `O_DIRECT` through a pinned bounce buffer.
+- **Less fixed VRAM.** The DSpark drafter loads only when `--mtp` > 0, and `SQUID_PREFILL_CHUNK` caps the prefill batch. `[mem]` log lines report free VRAM after init and after a run.
+
+## Build and run on an 8 GB card
+
+```bash
+git clone https://github.com/bigtimer-dev/squid5090-8gb.git && cd squid5090-8gb
+zig build -Doptimize=ReleaseFast -Dcuda-arch=89 -Dcuda-path=/opt/cuda   # 89 = RTX 40xx (Ada)
+
+# Weights: thinkingmachines/Inkling-2-Mini, see upstream step 3 below
+./zig-out/bin/squid5090 serve /opt/models/inkling-2-mini \
+  --mode nvfp4 --embed-host --mtp 0 --ctx 65536 --kv fp8 --host 127.0.0.1 --port 8080
+```
+
+The load log shows the split, for example `[weights] Experts: 18/48 banks in VRAM, 30 in pinned host RAM (8.01 GiB, zero-copy) | host bank-visits/token=42/96`. On an 8 GB card about 10 GiB of RAM is pinned: the offloaded experts, the embedding table and the prompt cache.
+
+For the uncensored model, build its folder with [`tools/uncensor-lora/make_uncensored.py`](tools/uncensor-lora/make_uncensored.py) (the steps are in its header), serve that folder, and add `--uncensor <folder>/uncensor.safetensors`.
+
+## Results on the RTX 4060 Laptop (8 GB)
+
+Both engines got the same prompts: 64K context, 8-bit KV cache, the uncensored model, temperature 0. llama.cpp runs the Q4_K GGUF with the experts on the CPU except for 6 loop layers (`-ub 64`, `q8_0` KV, 8 threads).
+
+| | llama.cpp | squid5090-8gb |
+|---|---:|---:|
+| Generation, short prompt | **18.6 tok/s** | 12.5 tok/s |
+| Generation after 12.6K tokens of context | **15.9 tok/s** | 12.2 tok/s |
+| Generation after 46K tokens of context | — | 11.7 tok/s |
+| Reading a 3.8K-token prompt | 76 tok/s (51 s) | **509 tok/s (7.5 s)** |
+| Reading a 12.6K-token prompt | 70 tok/s (181 s) | **495 tok/s (25.5 s)** |
+| Reading a 46K-token prompt | — | **500 tok/s (93 s)** |
+
+Generation is limited by PCIe: at 64K context, 42 of the 96 expert-bank visits per token are read from host RAM. Each bank that fits in VRAM adds about 0.5 tok/s, so a smaller context helps: `--ctx 32768` reaches 14.0 tok/s, and `--kv q4` reaches 13.6 tok/s at 64K (q4 quality not evaluated). Tool calls (plain and streamed) and the prefix cache work: the second turn of a 12.6K-token conversation starts in 0.8 s.
+
+What didn't help on this machine:
+- MTP drafting: 13.6 tok/s with it versus 14.6 without, at 8K context, because verifying drafts pulls in more experts over PCIe.
+- Write-combined host memory: no change.
+- A 1024-token prefill chunk: generation gains ~1 tok/s, but prompts are read at only ~410 tok/s.
+
+Only `--mode nvfp4` has been tested with the offload.
+
+### Fork-only options
+
+| | Default | Effect |
+|---|---|---|
+| `--uncensor PATH` | off | Projection directions to remove (`layer_dirs`, F32 `[24, 2304]`) |
+| `SQUID_VRAM_MARGIN_MB` | `192` | VRAM left free after weights and runtime buffers |
+| `SQUID_EXPERT_VRAM_MB` | auto | Fixed VRAM budget for expert banks |
+| `SQUID_PREFILL_CHUNK` | `2048` | Prefill batch size (32–2048, multiple of 8) |
+| `SQUID_HOST_WC` | `0` | `1` = write-combined host expert buffer |
+| `SQUID_LOAD_TRACE` | `0` | `1` = per-phase and per-bank load timings |
+
+---
+
 # squid5090
 
 **A single-binary, zero-Python TigerStyle Zig + Blackwell CUDA (`sm_120a`) inference engine and OpenAI-compatible API server for [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) — hitting `589.5 tok/s` code decode (`771.6 tok/s` on code-copy/RAG), `9,181 tok/s` prefill, and `1,048,576` (1M) context on a single RTX 5090.**

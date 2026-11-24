@@ -64,6 +64,18 @@ pub const ModelWeights = struct {
     arena: vram_arena.VRAMArena = .{},
     pinned_host_embed: ?*anyopaque = null,
 
+    // Small-GPU expert offload: banks that do not fit the VRAM budget live in ONE mapped pinned host
+    // allocation and are read zero-copy over PCIe. Bit (2 * layer + {0: w13, 1: w2}) set = bank on host.
+    host_expert_banks: u64 = 0,
+    pinned_host_experts: ?*anyopaque = null,
+    host_expert_dev: ?[*]u8 = null,
+    host_expert_capacity: u64 = 0,
+    host_expert_offset: u64 = 0,
+
+    // Uncensor: per-physical-layer unit refusal directions [24 * 2304], projected out of o_proj and
+    // expert-down outputs (before the short conv). Null = off.
+    uncensor_dirs: ?[*]f32 = null,
+
     embed: ?*anyopaque = null,
     embed_norm: ?*anyopaque = null,
     final_norm: ?*anyopaque = null,
@@ -85,6 +97,10 @@ pub const ModelWeights = struct {
             tiger.assert_cuda(cuda.squid_cuda_free_host(host_ptr));
             self.pinned_host_embed = null;
         }
+        if (self.pinned_host_experts) |host_ptr| {
+            tiger.assert_cuda(cuda.squid_cuda_free_host(host_ptr));
+            self.pinned_host_experts = null;
+        }
         self.* = .{};
     }
 
@@ -95,6 +111,8 @@ pub const ModelWeights = struct {
         load_mtp: bool,
         embed_on_host: bool,
         ablation_path: []const u8,
+        uncensor_path: []const u8,
+        runtime_reserve_bytes: u64,
     ) bool {
         tiger.assert(model_directory.len > 0);
         tiger.assert(self.arena.base_ptr == null);
@@ -136,6 +154,22 @@ pub const ModelWeights = struct {
         }
         defer if (has_ablation) sf_abl.close_file();
 
+        var unc_path_buf: [1024]u8 = undefined;
+        var sf_unc: safetensors.SafetensorsFile = .{};
+        var has_uncensor: bool = false;
+        if (uncensor_path.len > 0) {
+            tiger.assert(uncensor_path.len < unc_path_buf.len);
+            @memcpy(unc_path_buf[0..uncensor_path.len], uncensor_path);
+            unc_path_buf[uncensor_path.len] = 0;
+            const unc_path_z: [*:0]const u8 = @ptrCast(unc_path_buf[0..uncensor_path.len :0]);
+            if (!sf_unc.open_file(unc_path_z)) {
+                tiger.print_stderr("[weights] Failed to open uncensor safetensors: {s}\n", .{uncensor_path});
+                return false;
+            }
+            has_uncensor = true;
+        }
+        defer if (has_uncensor) sf_unc.close_file();
+
         const dense_kind: constants.WeightKind = switch (quant_mode) {
             .exact => .bf16,
             .fp8 => .fp8,
@@ -158,6 +192,24 @@ pub const ModelWeights = struct {
         }
         defer if (draft_vocab_host.len > 0) tiger.free_host_slice(i32, draft_vocab_host);
 
+        // --- PASS 0: Decide which expert banks fit in VRAM (rest -> zero-copy pinned host RAM) ---
+        const stage_bytes: u64 = @as(u64, constants.vocab_unpadded_count) * constants.hidden_dim * 2;
+        const all_host_mask: u64 = (@as(u64, 1) << @intCast(2 * constants.layer_count)) - 1;
+        const base_vram_bytes: u64 = compute_total_vram_bytes(
+            quant_mode,
+            dense_kind,
+            mtp_kind,
+            embed_on_host,
+            has_mtp,
+            has_pruned_draft_vocab,
+            draft_vocab_count,
+            has_ablation,
+            has_ablation_detectors,
+            all_host_mask,
+            has_uncensor,
+        );
+        self.host_expert_banks = plan_host_expert_banks(quant_mode, base_vram_bytes, @max(runtime_reserve_bytes, stage_bytes), runtime_reserve_bytes == 0);
+
         // --- PASS 1: Compute Exact 256-Byte-Aligned VRAM Arena Capacity ---
         const total_vram_bytes: u64 = compute_total_vram_bytes(
             quant_mode,
@@ -169,11 +221,32 @@ pub const ModelWeights = struct {
             draft_vocab_count,
             has_ablation,
             has_ablation_detectors,
+            self.host_expert_banks,
+            has_uncensor,
         );
+        const trace_env = tiger.getenv("SQUID_LOAD_TRACE");
+        const trace: bool = trace_env != null and trace_env.?[0] == '1';
+        var t_mark: u64 = tiger.clock_monotonic_ns();
         self.arena = vram_arena.VRAMArena.init(total_vram_bytes);
+        if (trace) trace_step(&t_mark, "vram arena alloc");
+
+        const host_bytes: u64 = compute_host_expert_bytes(quant_mode, self.host_expert_banks);
+        if (host_bytes > 0) {
+            const env_wc = tiger.getenv("SQUID_HOST_WC");
+            const wc_flag: u8 = if (env_wc != null and env_wc.?[0] == '1') 2 else 0;
+            var h_ptr: ?*anyopaque = null;
+            tiger.assert_cuda(cuda.squid_cuda_malloc_host_pinned(&h_ptr, @intCast(host_bytes), 1 | wc_flag));
+            tiger.assert(h_ptr != null);
+            var d_ptr: ?*anyopaque = null;
+            tiger.assert_cuda(cuda.squid_cuda_host_get_device_pointer(&d_ptr, h_ptr.?));
+            self.pinned_host_experts = h_ptr;
+            self.host_expert_dev = @ptrCast(d_ptr.?);
+            self.host_expert_capacity = host_bytes;
+            self.host_expert_offset = 0;
+        }
+        if (trace) trace_step(&t_mark, "pinned host expert alloc");
 
         // Temporary staging buffers on GPU for BF16 upload & quantization (freed before returning)
-        const stage_bytes: u64 = @as(u64, constants.vocab_unpadded_count) * constants.hidden_dim * 2;
         var d_stage_opt: ?*anyopaque = null;
         tiger.assert_cuda(cuda.squid_cuda_malloc(&d_stage_opt, @intCast(stage_bytes)));
         const d_stage: *anyopaque = d_stage_opt.?;
@@ -196,7 +269,7 @@ pub const ModelWeights = struct {
             tiger.assert(h_ptr != null);
             self.pinned_host_embed = h_ptr;
             const dst_slice = @as([*]u8, @ptrCast(h_ptr.?))[0..embed_bytes];
-            @memcpy(dst_slice, sf_main.data_slice(ei));
+            sf_main.copy_to_host(ei, dst_slice.ptr, embed_bytes);
             var dev_ptr: ?*anyopaque = null;
             tiger.assert_cuda(cuda.squid_cuda_host_get_device_pointer(&dev_ptr, h_ptr.?));
             self.embed = dev_ptr;
@@ -207,6 +280,7 @@ pub const ModelWeights = struct {
         } else {
             self.embed = self.upload_bf16(&sf_main, "model.llm.embed.weight", @as(u64, constants.vocab_padded_count) * constants.hidden_dim);
         }
+        if (trace) trace_step(&t_mark, "embed");
         self.embed_norm = self.upload_bf16(&sf_main, "model.llm.embed_norm.weight", constants.hidden_dim);
         self.final_norm = self.upload_bf16(&sf_main, "model.llm.norm.weight", constants.hidden_dim);
 
@@ -215,9 +289,10 @@ pub const ModelWeights = struct {
             const ui = sf_main.lookup("model.llm.unembed.weight");
             const usable_bytes: usize = @as(usize, constants.vocab_unpadded_count) * constants.hidden_dim * 2;
             tiger.assert(ui.byte_length >= usable_bytes);
-            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(d_stage, sf_main.data_ptr(ui), usable_bytes));
+            sf_main.copy_to_device(ui, d_stage, usable_bytes);
             self.unembed = self.pack_linear(d_stage, constants.vocab_unpadded_count, constants.hidden_dim, dense_kind, d_amax);
         }
+        if (trace) trace_step(&t_mark, "unembed");
 
         // AttnRes & cross-pass queries
         var name_buf: [128]u8 = undefined;
@@ -357,8 +432,20 @@ pub const ModelWeights = struct {
             lw.router_bias = self.upload_f32(&sf_main, rb_name, constants.expert_count);
 
             // MoE Expert Banks (w13 and w2)
-            lw.w13 = self.load_expert_bank(&sf_main, layer_idx, "w13", 2 * constants.intermediate_dim, constants.hidden_dim, quant_mode, d_stage);
-            lw.w2 = self.load_expert_bank(&sf_main, layer_idx, "w2", constants.hidden_dim, constants.intermediate_dim, quant_mode, d_stage);
+            if (trace) {
+                tiger.assert_cuda(cuda.squid_cuda_device_sync());
+                trace_step(&t_mark, "  layer dense");
+            }
+            lw.w13 = self.load_expert_bank(&sf_main, layer_idx, "w13", 2 * constants.intermediate_dim, constants.hidden_dim, quant_mode, d_stage, bank_on_host(self.host_expert_banks, layer_idx, 0));
+            if (trace) {
+                tiger.assert_cuda(cuda.squid_cuda_device_sync());
+                trace_step(&t_mark, if (bank_on_host(self.host_expert_banks, layer_idx, 0)) "  w13 -> host" else "  w13 -> vram");
+            }
+            lw.w2 = self.load_expert_bank(&sf_main, layer_idx, "w2", constants.hidden_dim, constants.intermediate_dim, quant_mode, d_stage, bank_on_host(self.host_expert_banks, layer_idx, 1));
+            if (trace) {
+                tiger.assert_cuda(cuda.squid_cuda_device_sync());
+                trace_step(&t_mark, if (bank_on_host(self.host_expert_banks, layer_idx, 1)) "  w2  -> host" else "  w2  -> vram");
+            }
         }
 
         // Load DSpark MTP weights if available
@@ -375,13 +462,40 @@ pub const ModelWeights = struct {
             );
         }
 
+        if (trace) trace_step(&t_mark, "dspark");
         if (has_ablation) {
             self.load_ablation(&sf_abl, has_ablation_detectors);
+        }
+
+        if (has_uncensor) {
+            const n: usize = @as(usize, constants.layer_count) * constants.hidden_dim;
+            const dirs_host = tiger.alloc_host_zeroed(f32, n);
+            defer tiger.free_host_slice(f32, dirs_host);
+            read_f32_or_bf16(&sf_unc, "layer_dirs", dirs_host);
+            normalize_rows_f32(dirs_host, constants.layer_count, constants.hidden_dim);
+            self.uncensor_dirs = self.arena.alloc_many(f32, n);
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(@ptrCast(self.uncensor_dirs.?), @ptrCast(dirs_host.ptr), n * 4));
         }
 
         tiger.assert_cuda(cuda.squid_cuda_device_sync());
         // Paired TigerStyle invariant: Pass 1 predicted byte total == Pass 2 exact arena usage!
         self.arena.assert_exact_fill();
+        tiger.assert(self.host_expert_offset == self.host_expert_capacity);
+        {
+            var banks_host: u32 = 0;
+            var host_visits: u32 = 0;
+            var li: u32 = 0;
+            while (li < constants.layer_count) : (li += 1) {
+                const nb: u32 = @as(u32, @intFromBool(bank_on_host(self.host_expert_banks, li, 0))) + @intFromBool(bank_on_host(self.host_expert_banks, li, 1));
+                banks_host += nb;
+                const visits: u32 = if (li >= constants.loop_start_layer and li < constants.loop_end_layer) 3 else 1;
+                host_visits += nb * visits;
+            }
+            tiger.print_stdout(
+                "[weights] Experts: {d}/48 banks in VRAM, {d} in pinned host RAM ({d:.2} GiB, zero-copy) | host bank-visits/token={d}/96 | Uncensor={s}\n",
+                .{ 48 - banks_host, banks_host, @as(f64, @floatFromInt(self.host_expert_capacity)) / (1024.0 * 1024.0 * 1024.0), host_visits, if (has_uncensor) "on" else "off" },
+            );
+        }
 
         const elapsed_sec: f64 = @as(f64, @floatFromInt(tiger.clock_monotonic_ns() - start_ns)) / 1_000_000_000.0;
         const vram_gib: f64 = @as(f64, @floatFromInt(self.arena.capacity_bytes)) / (1024.0 * 1024.0 * 1024.0);
@@ -470,6 +584,7 @@ pub const ModelWeights = struct {
         cols: u32,
         quant_mode: constants.QuantMode,
         d_stage: *anyopaque,
+        on_host: bool,
     ) cuda.CExpertBank {
         var eb: cuda.CExpertBank = .{
             .n_experts = constants.expert_count,
@@ -477,18 +592,26 @@ pub const ModelWeights = struct {
             .cols = @intCast(cols),
         };
         var nbuf: [128]u8 = undefined;
+        var nbuf2: [128]u8 = undefined;
         const ckpt_nvfp4: bool = constants.is_nvfp4_expert_layer(layer_idx);
         if (ckpt_nvfp4) {
             eb.is_nvfp4 = 1;
             const w_bytes: u64 = @as(u64, constants.expert_count) * rows * (cols / 2);
             const s_bytes: u64 = @as(u64, constants.expert_count) * rows * (cols / 16);
-            eb.data = self.arena.alloc_many(u8, w_bytes);
-            eb.scales = self.arena.alloc_many(u8, s_bytes);
-
             const wn = std.fmt.bufPrint(&nbuf, "model.llm.layers.{d}.mlp.experts.{s}_weight", .{ layer_idx, wname }) catch unreachable;
-            upload_raw(sf, wn, @ptrCast(eb.data.?), w_bytes);
+            if (on_host) {
+                eb.data = self.host_copy_tensor(sf, wn, w_bytes);
+            } else {
+                eb.data = self.arena.alloc_many(u8, w_bytes);
+                upload_raw(sf, wn, @ptrCast(eb.data.?), w_bytes);
+            }
             const sn = std.fmt.bufPrint(&nbuf, "model.llm.layers.{d}.mlp.experts.{s}_weight_scale", .{ layer_idx, wname }) catch unreachable;
-            upload_raw(sf, sn, @ptrCast(eb.scales.?), s_bytes);
+            if (on_host) {
+                eb.scales = self.host_copy_tensor(sf, sn, s_bytes);
+            } else {
+                eb.scales = self.arena.alloc_many(u8, s_bytes);
+                upload_raw(sf, sn, @ptrCast(eb.scales.?), s_bytes);
+            }
 
             const an = std.fmt.bufPrint(&nbuf, "model.llm.layers.{d}.mlp.experts.{s}_weight_amax", .{ layer_idx, wname }) catch unreachable;
             const amax_slice = sf.data_slice(sf.lookup(an));
@@ -511,38 +634,107 @@ pub const ModelWeights = struct {
             eb.is_nvfp4 = 0;
             const w_bytes: u64 = @as(u64, constants.expert_count) * rows * cols;
             const s_bytes: u64 = @as(u64, constants.expert_count) * rows * (cols / 32);
-            eb.data = self.arena.alloc_many(u8, w_bytes);
-            eb.scales = self.arena.alloc_many(u8, s_bytes);
             const wn = std.fmt.bufPrint(&nbuf, "model.llm.layers.{d}.mlp.experts.{s}_weight", .{ layer_idx, wname }) catch unreachable;
-            upload_raw(sf, wn, @ptrCast(eb.data.?), w_bytes);
             const sn = std.fmt.bufPrint(&nbuf, "model.llm.layers.{d}.mlp.experts.{s}_weight_scale", .{ layer_idx, wname }) catch unreachable;
-            upload_raw(sf, sn, @ptrCast(eb.scales.?), s_bytes);
+            if (on_host) {
+                eb.data = self.host_copy_tensor(sf, wn, w_bytes);
+                eb.scales = self.host_copy_tensor(sf, sn, s_bytes);
+            } else {
+                eb.data = self.arena.alloc_many(u8, w_bytes);
+                eb.scales = self.arena.alloc_many(u8, s_bytes);
+                upload_raw(sf, wn, @ptrCast(eb.data.?), w_bytes);
+                upload_raw(sf, sn, @ptrCast(eb.scales.?), s_bytes);
+            }
         } else {
             eb.is_nvfp4 = 1;
             const mx_w_bytes: u64 = @as(u64, constants.expert_count) * rows * cols;
             const mx_s_bytes: u64 = @as(u64, constants.expert_count) * rows * (cols / 32);
-            const tmp_w: [*]u8 = @ptrCast(d_stage);
-            const tmp_s: [*]u8 = tmp_w + @as(usize, @intCast(mx_w_bytes));
             const wn = std.fmt.bufPrint(&nbuf, "model.llm.layers.{d}.mlp.experts.{s}_weight", .{ layer_idx, wname }) catch unreachable;
-            upload_raw(sf, wn, @ptrCast(tmp_w), mx_w_bytes);
-            const sn = std.fmt.bufPrint(&nbuf, "model.llm.layers.{d}.mlp.experts.{s}_weight_scale", .{ layer_idx, wname }) catch unreachable;
-            upload_raw(sf, sn, @ptrCast(tmp_s), mx_s_bytes);
+            const sn = std.fmt.bufPrint(&nbuf2, "model.llm.layers.{d}.mlp.experts.{s}_weight_scale", .{ layer_idx, wname }) catch unreachable;
 
             eb.expert_scale = self.arena.alloc_many(f32, constants.expert_count);
-            eb.data = self.arena.alloc_many(u8, @as(u64, constants.expert_count) * rows * (cols / 2));
-            eb.scales = self.arena.alloc_many(u8, @as(u64, constants.expert_count) * rows * (cols / 16));
-            cuda.squid_convert_mxfp8_to_nvfp4_experts(
-                tmp_w,
-                tmp_s,
-                eb.data.?,
-                eb.scales.?,
-                eb.expert_scale.?,
-                constants.expert_count,
-                @intCast(rows),
-                @intCast(cols),
-            );
+            const nv_w_bytes: u64 = @as(u64, constants.expert_count) * rows * (cols / 2);
+            const nv_s_bytes: u64 = @as(u64, constants.expert_count) * rows * (cols / 16);
+            if (!on_host) {
+                const tmp_w: [*]u8 = @ptrCast(d_stage);
+                const tmp_s: [*]u8 = tmp_w + @as(usize, @intCast(mx_w_bytes));
+                upload_raw(sf, wn, @ptrCast(tmp_w), mx_w_bytes);
+                upload_raw(sf, sn, @ptrCast(tmp_s), mx_s_bytes);
+                eb.data = self.arena.alloc_many(u8, nv_w_bytes);
+                eb.scales = self.arena.alloc_many(u8, nv_s_bytes);
+                cuda.squid_convert_mxfp8_to_nvfp4_experts(
+                    tmp_w,
+                    tmp_s,
+                    eb.data.?,
+                    eb.scales.?,
+                    eb.expert_scale.?,
+                    constants.expert_count,
+                    @intCast(rows),
+                    @intCast(cols),
+                );
+            } else {
+                // Host bank: convert 64 experts at a time inside the VRAM stage, then DMA into pinned host RAM.
+                // (Letting the conversion kernel store straight into mapped host memory crawls at ~12 MB/s.)
+                const host_base: [*]u8 = @ptrCast(self.pinned_host_experts.?);
+                const host_w_off: usize = @intCast(self.host_expert_offset);
+                eb.data = self.host_alloc(nv_w_bytes);
+                const host_s_off: usize = @intCast(self.host_expert_offset);
+                eb.scales = self.host_alloc(nv_s_bytes);
+                const group: u64 = 64;
+                const a = constants.vram_alignment_bytes;
+                const g_mx_w: u64 = group * rows * cols;
+                const g_mx_s: u64 = group * rows * (cols / 32);
+                const g_nv_w: u64 = group * rows * (cols / 2);
+                const g_nv_s: u64 = group * rows * (cols / 16);
+                const off_s: u64 = tiger.align_up_u64(g_mx_w, a);
+                const off_ow: u64 = off_s + tiger.align_up_u64(g_mx_s, a);
+                const off_os: u64 = off_ow + tiger.align_up_u64(g_nv_w, a);
+                tiger.assert(off_os + g_nv_s <= @as(u64, constants.vocab_unpadded_count) * constants.hidden_dim * 2);
+                const wi = sf.lookup(wn);
+                const si = sf.lookup(sn);
+                tiger.assert(wi.byte_length == mx_w_bytes and si.byte_length == mx_s_bytes);
+                const st: [*]u8 = @ptrCast(d_stage);
+                var g: u64 = 0;
+                while (g < constants.expert_count / group) : (g += 1) {
+                    sf.copy_range_to_device(wi, g * g_mx_w, g_mx_w, @ptrCast(st));
+                    sf.copy_range_to_device(si, g * g_mx_s, g_mx_s, @ptrCast(st + @as(usize, @intCast(off_s))));
+                    cuda.squid_convert_mxfp8_to_nvfp4_experts(
+                        st,
+                        st + @as(usize, @intCast(off_s)),
+                        st + @as(usize, @intCast(off_ow)),
+                        st + @as(usize, @intCast(off_os)),
+                        eb.expert_scale.? + @as(usize, @intCast(g * group)),
+                        @intCast(group),
+                        @intCast(rows),
+                        @intCast(cols),
+                    );
+                    tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h(@ptrCast(host_base + host_w_off + @as(usize, @intCast(g * g_nv_w))), @ptrCast(st + @as(usize, @intCast(off_ow))), @intCast(g_nv_w)));
+                    tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h(@ptrCast(host_base + host_s_off + @as(usize, @intCast(g * g_nv_s))), @ptrCast(st + @as(usize, @intCast(off_os))), @intCast(g_nv_s)));
+                }
+            }
         }
         return eb;
+    }
+
+    /// Bump-allocate from the mapped pinned host expert arena; returns the DEVICE pointer.
+    fn host_alloc(self: *ModelWeights, bytes: u64) [*]u8 {
+        tiger.assert(self.host_expert_dev != null and bytes > 0);
+        const aligned: u64 = tiger.align_up_u64(bytes, constants.vram_alignment_bytes);
+        tiger.assert(aligned <= self.host_expert_capacity - self.host_expert_offset);
+        const off: usize = @intCast(self.host_expert_offset);
+        self.host_expert_offset += aligned;
+        return self.host_expert_dev.? + off;
+    }
+
+    /// Copy a checkpoint tensor (mmap) into the pinned host expert arena with a CPU memcpy.
+    fn host_copy_tensor(self: *ModelWeights, sf: *const safetensors.SafetensorsFile, name: []const u8, expected_bytes: u64) [*]u8 {
+        const info = sf.lookup(name);
+        tiger.assert(info.byte_length == expected_bytes);
+        const off: usize = @intCast(self.host_expert_offset);
+        const dev = self.host_alloc(expected_bytes);
+        const host_base: [*]u8 = @ptrCast(self.pinned_host_experts.?);
+        sf.copy_to_host(info, host_base + off, expected_bytes);
+        return dev;
     }
 
     fn load_dspark(
@@ -818,7 +1010,7 @@ fn normalize_rows_f32(buf: []f32, rows: usize, cols: usize) void {
 fn upload_raw(sf: *const safetensors.SafetensorsFile, name: []const u8, dst_dev: *anyopaque, expected_bytes: u64) void {
     const info = sf.lookup(name);
     tiger.assert(info.byte_length == expected_bytes);
-    tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(dst_dev, sf.data_ptr(info), @intCast(expected_bytes)));
+    sf.copy_to_device(info, dst_dev, expected_bytes);
 }
 
 fn stage_layer_raw(sf: *const safetensors.SafetensorsFile, layer_idx: u32, suffix: []const u8, dst_dev: [*]u8, expected_bytes: u64) usize {
@@ -869,6 +1061,104 @@ fn try_load_draft_vocab(model_directory: []const u8, quant_mode: constants.Quant
 }
 
 /// Pass 1: exact 256-byte-aligned VRAM byte accounting matching Pass 2 allocation-for-allocation.
+fn trace_step(t_mark: *u64, what: []const u8) void {
+    const now = tiger.clock_monotonic_ns();
+    tiger.print_stdout("[load] {s}: {d:.2}s\n", .{ what, @as(f64, @floatFromInt(now - t_mark.*)) / 1e9 });
+    t_mark.* = now;
+}
+
+pub fn bank_on_host(mask: u64, layer: u32, bank: u32) bool {
+    tiger.assert(layer < constants.layer_count and bank < 2);
+    return (mask >> @intCast(2 * layer + bank)) & 1 == 1;
+}
+
+/// Bytes of one expert bank's data + scales (what moves to host RAM; the f32 expert_scale stays in VRAM).
+fn expert_bank_movable_bytes(quant_mode: constants.QuantMode, layer: u32, bank: u32) u64 {
+    const a = constants.vram_alignment_bytes;
+    const rows: u64 = if (bank == 0) 2 * constants.intermediate_dim else constants.hidden_dim;
+    const cols: u64 = if (bank == 0) constants.hidden_dim else constants.intermediate_dim;
+    const e: u64 = constants.expert_count;
+    if (constants.is_nvfp4_expert_layer(layer) or quant_mode == .nvfp4) {
+        return tiger.align_up_u64(e * rows * (cols / 2), a) + tiger.align_up_u64(e * rows * (cols / 16), a);
+    }
+    return tiger.align_up_u64(e * rows * cols, a) + tiger.align_up_u64(e * rows * (cols / 32), a);
+}
+
+fn compute_host_expert_bytes(quant_mode: constants.QuantMode, host_mask: u64) u64 {
+    var total: u64 = 0;
+    var l: u32 = 0;
+    while (l < constants.layer_count) : (l += 1) {
+        var b: u32 = 0;
+        while (b < 2) : (b += 1) {
+            if (bank_on_host(host_mask, l, b)) total += expert_bank_movable_bytes(quant_mode, l, b);
+        }
+    }
+    return total;
+}
+
+fn env_mib(name: [*:0]const u8) ?u64 {
+    const v = tiger.getenv(name) orelse return null;
+    const n = std.fmt.parseInt(u64, std.mem.span(v), 10) catch return null;
+    return n * 1024 * 1024;
+}
+
+/// Greedy placement: looped layers 6..17 first (3 visits/token, so 3x the traffic saved per byte), then the
+/// prelude/coda layers. Budget = SQUID_EXPERT_VRAM_MB if set, else free VRAM - non-expert weights - reserve - margin
+/// (SQUID_VRAM_MARGIN_MB, default 192). `legacy_all_vram` keeps upstream behaviour (every bank resident).
+fn plan_host_expert_banks(quant_mode: constants.QuantMode, base_vram_bytes: u64, reserve_bytes: u64, legacy_all_vram: bool) u64 {
+    const all_host_mask: u64 = (@as(u64, 1) << @intCast(2 * constants.layer_count)) - 1;
+    var budget: u64 = 0;
+    if (env_mib("SQUID_EXPERT_VRAM_MB")) |b| {
+        budget = b;
+    } else if (legacy_all_vram) {
+        return 0;
+    } else {
+        var free_b: usize = 0;
+        var total_b: usize = 0;
+        tiger.assert_cuda(cuda.squid_cuda_mem_get_info(&free_b, &total_b));
+        const margin: u64 = env_mib("SQUID_VRAM_MARGIN_MB") orelse 192 * 1024 * 1024;
+        const need: u64 = base_vram_bytes + reserve_bytes + margin;
+        budget = if (free_b > need) free_b - need else 0;
+        tiger.print_stdout(
+            "[weights] VRAM free={d:.2} GiB | non-expert weights={d:.2} GiB | reserve={d:.2} GiB + margin={d:.2} GiB -> expert budget={d:.2} GiB\n",
+            .{
+                @as(f64, @floatFromInt(free_b)) / 1073741824.0,
+                @as(f64, @floatFromInt(base_vram_bytes)) / 1073741824.0,
+                @as(f64, @floatFromInt(reserve_bytes)) / 1073741824.0,
+                @as(f64, @floatFromInt(margin)) / 1073741824.0,
+                @as(f64, @floatFromInt(budget)) / 1073741824.0,
+            },
+        );
+    }
+    var host: u64 = all_host_mask;
+    var used: u64 = 0;
+    var order: [constants.layer_count]u32 = undefined;
+    var n: usize = 0;
+    var l: u32 = constants.loop_start_layer;
+    while (l < constants.loop_end_layer) : (l += 1) {
+        order[n] = l;
+        n += 1;
+    }
+    l = 0;
+    while (l < constants.layer_count) : (l += 1) {
+        if (l >= constants.loop_start_layer and l < constants.loop_end_layer) continue;
+        order[n] = l;
+        n += 1;
+    }
+    tiger.assert(n == constants.layer_count);
+    for (order) |layer| {
+        var b: u32 = 0;
+        while (b < 2) : (b += 1) {
+            const bytes = expert_bank_movable_bytes(quant_mode, layer, b);
+            if (used + bytes <= budget) {
+                used += bytes;
+                host &= ~(@as(u64, 1) << @intCast(2 * layer + b));
+            }
+        }
+    }
+    return host;
+}
+
 fn compute_total_vram_bytes(
     quant_mode: constants.QuantMode,
     dense_kind: constants.WeightKind,
@@ -879,9 +1169,12 @@ fn compute_total_vram_bytes(
     draft_vocab_count: u32,
     has_ablation: bool,
     has_ablation_detectors: bool,
+    host_mask: u64,
+    has_uncensor: bool,
 ) u64 {
     const a = constants.vram_alignment_bytes;
     var total: u64 = 0;
+    if (has_uncensor) total += tiger.align_up_u64(@as(u64, constants.layer_count) * constants.hidden_dim * 4, a);
 
     if (!embed_on_host) {
         total += tiger.align_up_u64(@as(u64, constants.vocab_padded_count) * constants.hidden_dim * 2, a);
@@ -955,13 +1248,18 @@ fn compute_total_vram_bytes(
             .{ constants.hidden_dim, constants.intermediate_dim },
         };
         const is_nvfp4_bank: bool = constants.is_nvfp4_expert_layer(l) or quant_mode == .nvfp4;
-        for (dims) |d| {
+        for (dims, 0..) |d, bank| {
             const rows: u64 = d[0];
             const cols: u64 = d[1];
+            const on_host: bool = bank_on_host(host_mask, l, @intCast(bank));
             if (is_nvfp4_bank) {
-                total += tiger.align_up_u64(@as(u64, constants.expert_count) * rows * (cols / 2), a);
-                total += tiger.align_up_u64(@as(u64, constants.expert_count) * rows * (cols / 16), a);
+                if (!on_host) {
+                    total += tiger.align_up_u64(@as(u64, constants.expert_count) * rows * (cols / 2), a);
+                    total += tiger.align_up_u64(@as(u64, constants.expert_count) * rows * (cols / 16), a);
+                }
                 total += tiger.align_up_u64(constants.expert_count * 4, a);
+            } else if (on_host) {
+                // data + scales live in pinned host RAM; MXFP8 banks carry no f32 expert_scale
             } else {
                 total += tiger.align_up_u64(@as(u64, constants.expert_count) * rows * cols, a);
                 total += tiger.align_up_u64(@as(u64, constants.expert_count) * rows * (cols / 32), a);

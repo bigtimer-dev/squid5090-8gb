@@ -124,6 +124,8 @@ pub const SIG_IGN: SignalHandler = @ptrFromInt(1);
 pub extern "c" fn open(pathname: [*:0]const u8, flags: i32, ...) i32;
 pub extern "c" fn close(fd: i32) i32;
 pub extern "c" fn read(fd: i32, buffer: [*]u8, count: usize) isize;
+pub extern "c" fn pread(fd: i32, buffer: [*]u8, count: usize, offset: i64) isize;
+pub const O_DIRECT: i32 = 0o40000;
 pub extern "c" fn write(fd: i32, buffer: [*]const u8, count: usize) isize;
 pub extern "c" fn lseek(fd: i32, offset: i64, whence: i32) i64;
 pub extern "c" fn mmap(addr: ?*anyopaque, length: usize, prot: i32, flags: i32, fd: i32, offset: i64) *anyopaque;

@@ -82,6 +82,7 @@ pub extern "c" fn squid_cuda_malloc(ptr: *?*anyopaque, bytes: usize) i32;
 pub extern "c" fn squid_cuda_free(ptr: ?*anyopaque) i32;
 pub extern "c" fn squid_cuda_malloc_host_pinned(ptr: *?*anyopaque, bytes: usize, mapped: u8) i32;
 pub extern "c" fn squid_cuda_free_host(ptr: ?*anyopaque) i32;
+pub extern "c" fn squid_cuda_mem_get_info(free_bytes: *usize, total_bytes: *usize) i32;
 pub extern "c" fn squid_cuda_host_get_device_pointer(dev_ptr: *?*anyopaque, host_ptr: *anyopaque) i32;
 pub extern "c" fn squid_cuda_memcpy_h2d(dst: *anyopaque, src: *const anyopaque, bytes: usize) i32;
 pub extern "c" fn squid_cuda_memcpy_d2h(dst: *anyopaque, src: *const anyopaque, bytes: usize) i32;
@@ -160,6 +161,13 @@ pub extern "c" fn squid_launch_embed_norm(
     tokens: [*]const i32,
     out: [*]f32,
     batch_size: i32,
+    stream: ?*anyopaque,
+) void;
+
+pub extern "c" fn squid_launch_dir_project(
+    y: [*]f32,
+    dir: [*]const f32,
+    n_vecs: i32,
     stream: ?*anyopaque,
 ) void;
 

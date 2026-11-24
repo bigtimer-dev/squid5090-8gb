@@ -117,6 +117,9 @@ void launch_embed_norm(
     int B,
     cudaStream_t stream);
 
+// Uncensor: y[i] <- y[i] - dir * (dir . y[i]) for n_vecs HIDDEN-wide vectors (dir unit-norm, in place)
+void launch_dir_project(float* y, const float* dir, int n_vecs, cudaStream_t stream);
+
 // RMSNorm: out[b, g, d] = x[b, g, d] / sqrt(mean(x^2) + eps) * (weight ? weight[d] : 1)
 void launch_rmsnorm(
     const float* x,

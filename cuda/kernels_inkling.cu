@@ -2464,6 +2464,35 @@ __global__ void extract_block_kernel(const float* __restrict__ blocks, int max_b
     }
 }
 
+// Rank-1 refusal-direction removal (uncensor LoRA, applied exactly at runtime):
+// y <- y - dir * (dir . y), in place, one 576-thread block per HIDDEN vector (dir is unit-norm).
+// Runs on the raw writer output (o_proj / expert down sum / per-slot expert down) BEFORE the short conv,
+// matching a LoRA delta B(Ax) with A = -W^T b merged into W_o and every expert's down_proj.
+__global__ void __launch_bounds__(576)
+dir_project_kernel(float* __restrict__ y, const float* __restrict__ dir) {
+    pdl_wait();
+    pdl_trigger();
+    float* yv = y + (size_t)blockIdx.x * HIDDEN;
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int c4 = tid << 2;
+    __shared__ float sm[18];
+    __shared__ float s_dot;
+    float4 v = *reinterpret_cast<const float4*>(yv + c4);
+    float4 d = __ldg(reinterpret_cast<const float4*>(dir + c4));
+    float part = warp_sum(f4_dot(v, d));
+    if (lane == 0) sm[warp] = part;
+    __syncthreads();
+    if (warp == 0) {
+        float tot = warp_sum((lane < 18) ? sm[lane] : 0.0f);
+        if (lane == 0) s_dot = tot;
+    }
+    __syncthreads();
+    float k = s_dot;
+    *reinterpret_cast<float4*>(yv + c4) = make_float4(v.x - k * d.x, v.y - k * d.y, v.z - k * d.z, v.w - k * d.w);
+}
+
 } // namespace
 
 void launch_embed_norm(
@@ -2839,6 +2868,11 @@ void launch_copy_block(const float* src, float* blocks, int max_blocks, int slot
 void launch_extract_block(const float* blocks, int max_blocks, int slot_idx, float* dst, int B, cudaStream_t stream) {
     int total = B * HIDDEN;
     extract_block_kernel<<<(total + 255) / 256, 256, 0, stream>>>(blocks, max_blocks, slot_idx, dst, B);
+}
+
+void launch_dir_project(float* y, const float* dir, int n_vecs, cudaStream_t stream) {
+    if (n_vecs <= 0) return;
+    dir_project_kernel<<<n_vecs, 576, 0, stream>>>(y, dir);
 }
 
 } // namespace squid

@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const constants = @import("constants.zig");
+const cuda = @import("cuda.zig");
 const engine_mod = @import("engine.zig");
 const server_mod = @import("server.zig");
 const tiger = @import("tiger.zig");
@@ -31,6 +32,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var model_name: []const u8 = "inkling-2-mini";
     var model_name_explicit: bool = false;
     var ablation_path: []const u8 = "";
+    var uncensor_path: []const u8 = "";
     var effort: []const u8 = "none";
     var api_key: []const u8 = "";
     if (tiger.getenv("SQUID_API_KEY")) |env_key| api_key = std.mem.span(env_key);
@@ -86,6 +88,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, arg, "--ablation") and arg_i + 1 < argv.len) {
             arg_i += 1;
             ablation_path = std.mem.span(argv[arg_i]);
+        } else if (std.mem.eql(u8, arg, "--uncensor") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            uncensor_path = std.mem.span(argv[arg_i]);
         } else if (std.mem.eql(u8, arg, "--effort") and arg_i + 1 < argv.len) {
             arg_i += 1;
             effort = std.mem.span(argv[arg_i]);
@@ -221,14 +226,21 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (ablation_path.len > 0 and !model_name_explicit) {
         model_name = "inkling-2-mini-abliterated";
     }
+    if (uncensor_path.len > 0 and !model_name_explicit) {
+        model_name = "inkling-2-mini-uncensored";
+    }
 
     var model_weights: weights_mod.ModelWeights = .{};
-    const load_mtp: bool = (mtp > 0 or std.mem.eql(u8, command, "bench") or std.mem.eql(u8, command, "longctx") or std.mem.eql(u8, command, "serve"));
-    if (!model_weights.load(model_directory, quant_mode, load_mtp, embed_on_host, ablation_path)) return 1;
+    // Small-GPU fork: load the DSpark drafter only when drafting is requested (--mtp > 0); with experts streamed over
+    // PCIe, speculative verify steps cost more than they save, and the drafter's VRAM is better spent on expert banks.
+    const load_mtp: bool = (mtp > 0 or std.mem.eql(u8, command, "longctx"));
+    const runtime_reserve: u64 = engine_mod.estimate_runtime_vram_bytes(ctx, kv_format, load_mtp);
+    if (!model_weights.load(model_directory, quant_mode, load_mtp, embed_on_host, ablation_path, uncensor_path, runtime_reserve)) return 1;
     defer model_weights.deinit();
 
     var engine: engine_mod.Engine = .{};
     engine.init(&model_weights, ctx, use_graphs, kv_format);
+    print_vram_free("after init");
     engine.spec_threshold = spec_threshold;
     engine.use_prompt_lookup = use_prompt_lookup;
     engine.sample_params = .{
@@ -281,6 +293,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     if (std.mem.eql(u8, command, "generate")) {
         const st = engine.generate(prompt_ids_buf[0..prompt_len], max_tokens, mtp, out_tokens_buf, null, null);
+        print_vram_free("after generate");
         const dec_toks: f64 = @floatFromInt(if (st.generated_tokens > 0) st.generated_tokens - 1 else 0);
         const tps: f64 = if (st.decode_ms > 0.0) (dec_toks * 1000.0 / st.decode_ms) else 0.0;
         const acc_pct: f64 = if (st.total_drafts > 0) (100.0 * @as(f64, @floatFromInt(st.total_accepted)) / @as(f64, @floatFromInt(st.total_drafts))) else 0.0;
@@ -299,6 +312,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const clamped_runs: usize = @min(@max(runs, 1), bench_runs_max);
         // 1 warmup run (also captures CUDA Graph)
         _ = engine.generate(prompt_ids_buf[0..prompt_len], @min(32, max_tokens), mtp, out_tokens_buf, null, null);
+        print_vram_free("after warmup");
 
         var speeds: [bench_runs_max]f64 = undefined;
         var last_acc: f64 = 0.0;
@@ -425,10 +439,17 @@ fn print_usage() void {
     tiger.write_fd_all(2,
         "squid5090 — TigerStyle Zig + Blackwell CUDA Inference Engine & OpenAI Server for Inkling-2-Mini\n\n" ++
             "Usage:\n" ++
-            "  squid5090 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode nvfp4|fp8|exact] [--kv auto|bf16|fp8|q4] [--ctx 65536] [--mtp 7] [--spec-threshold 0.80] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--keep-history-thinking] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n" ++
-            "  squid5090 generate <model_dir> (--prompt TEXT | --tokens CSV | --tokens-file PATH) [--mode nvfp4] [--kv auto] [--mtp 7] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--top-k 0] [--seed N] [--ablation PATH] [--max-tokens 512] [--ctx 8192]\n" ++
-            "  squid5090 bench    <model_dir> (--prompt TEXT | --tokens CSV) [--mode nvfp4] [--kv auto] [--mtp 7] [--spec-threshold 0.80] [--ablation PATH] [--max-tokens 512] [--runs 6] [--ctx 8192]\n" ++
+            "  squid5090 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode nvfp4|fp8|exact] [--kv auto|bf16|fp8|q4] [--ctx 65536] [--mtp 7] [--spec-threshold 0.80] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--keep-history-thinking] [--ablation PATH] [--uncensor PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n" ++
+            "  squid5090 generate <model_dir> (--prompt TEXT | --tokens CSV | --tokens-file PATH) [--mode nvfp4] [--kv auto] [--mtp 7] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--top-k 0] [--seed N] [--ablation PATH] [--uncensor PATH] [--max-tokens 512] [--ctx 8192]\n" ++
+            "  squid5090 bench    <model_dir> (--prompt TEXT | --tokens CSV) [--mode nvfp4] [--kv auto] [--mtp 7] [--spec-threshold 0.80] [--ablation PATH] [--uncensor PATH] [--max-tokens 512] [--runs 6] [--ctx 8192]\n" ++
             "  squid5090 longctx  <model_dir> [--mode nvfp4] [--kv fp8|q4|bf16] [--ctx 1048576]\n" ++
             "  squid5090 tokenize <model_dir> --prompt TEXT [--raw]\n",
     );
+}
+
+fn print_vram_free(tag: []const u8) void {
+    var free_b: usize = 0;
+    var total_b: usize = 0;
+    if (cuda.squid_cuda_mem_get_info(&free_b, &total_b) != 0) return;
+    tiger.print_stdout("[mem] VRAM free {s}: {d:.0} MiB of {d:.0} MiB\n", .{ tag, @as(f64, @floatFromInt(free_b)) / 1048576.0, @as(f64, @floatFromInt(total_b)) / 1048576.0 });
 }
