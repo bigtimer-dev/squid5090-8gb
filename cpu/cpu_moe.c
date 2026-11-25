@@ -368,6 +368,10 @@ typedef struct {
     const uint8_t* w13_scales; // [E][2304][144]
     const uint8_t* w2_codes;   // [E][2304][576]
     const uint8_t* w2_scales;  // [E][2304][72]
+    // xp[e] = expert e's first row in each of the four arrays (w13 codes, w13 scales, w2 codes, w2 scales): the bank
+    // layout above (cpu_moe_set_layer), or a single expert's own copy (cpu_moe_set_expert: a demoted expert of a
+    // VRAM-resident layer). The visit kernels address weights only through xp.
+    const uint8_t* xp[128][4];
     float es13[128];
     float es2[128];
 } LayerBanks;
@@ -439,9 +443,9 @@ static void phase_up(const LayerBanks* lb, VisitState* vs, int b0, int b1) {
         const float es = lb->es13[e];
         for (int t = 0; t < 16; ++t) {
             const int i = i0 + t;
-            const size_t r0 = (size_t)e * (2 * INTER) + 2 * (size_t)i;
-            const uint8_t* c0 = lb->w13_codes + r0 * row_cb;
-            const uint8_t* s0 = lb->w13_scales + r0 * row_sb;
+            const size_t r0 = 2 * (size_t)i;
+            const uint8_t* c0 = lb->xp[e][0] + r0 * row_cb;
+            const uint8_t* s0 = lb->xp[e][1] + r0 * row_sb;
             float g, u;
             const uint8_t *pfc = NULL, *pfs = NULL;
             if (g_pf_pairs && i + g_pf_pairs < INTER && 16 * blk + t + g_pf_pairs < 16 * b1) {
@@ -480,9 +484,9 @@ static void phase_down(const LayerBanks* lb, const VisitState* vs, int r0, int r
         for (int j = 0; j < vs->nsl; ++j) {
             const int k = vs->sl[j];
             const int e = vs->ids[k];
-            const size_t row = (size_t)e * HIDDEN + r;
-            const uint8_t* c0 = lb->w2_codes + row * row_cb;
-            const uint8_t* s0 = lb->w2_scales + row * row_sb;
+            const size_t row = (size_t)r;
+            const uint8_t* c0 = lb->xp[e][2] + row * row_cb;
+            const uint8_t* s0 = lb->xp[e][3] + row * row_sb;
             const uint8_t* c1 = two ? c0 + row_cb : c0;
             const uint8_t* s1 = two ? s0 + row_sb : s0;
             float d0, d1;
@@ -526,9 +530,9 @@ static void phase_down_kouter(const LayerBanks* lb, const VisitState* vs, int r0
         const float es = lb->es2[e], wk = vs->wts[k];
         for (int r = r0; r < r1; r += 2) {
             const int two = (r + 1 < r1);
-            const size_t row = (size_t)e * HIDDEN + r;
-            const uint8_t* c0 = lb->w2_codes + row * row_cb;
-            const uint8_t* s0 = lb->w2_scales + row * row_sb;
+            const size_t row = (size_t)r;
+            const uint8_t* c0 = lb->xp[e][2] + row * row_cb;
+            const uint8_t* s0 = lb->xp[e][3] + row * row_sb;
             const uint8_t* c1 = two ? c0 + row_cb : c0;
             const uint8_t* s1 = two ? s0 + row_sb : s0;
             float d0, d1;
@@ -939,8 +943,42 @@ void cpu_moe_set_layer(int layer, const uint8_t* w13_codes, const uint8_t* w13_s
     lb->w13_scales = w13_scales;
     lb->w2_codes = w2_codes;
     lb->w2_scales = w2_scales;
+    for (int e = 0; e < 128; ++e) {
+        lb->xp[e][0] = w13_codes ? w13_codes + (size_t)e * (2 * INTER) * (HIDDEN / 2) : NULL;
+        lb->xp[e][1] = w13_scales ? w13_scales + (size_t)e * (2 * INTER) * (HIDDEN / 16) : NULL;
+        lb->xp[e][2] = w2_codes ? w2_codes + (size_t)e * HIDDEN * (INTER / 2) : NULL;
+        lb->xp[e][3] = w2_scales ? w2_scales + (size_t)e * HIDDEN * (INTER / 16) : NULL;
+    }
     if (es13) memcpy(lb->es13, es13, sizeof lb->es13);
     if (es2) memcpy(lb->es2, es2, sizeof lb->es2);
+}
+
+void cpu_moe_set_expert(int layer, int e, const uint8_t* w13_codes, const uint8_t* w13_scales, float es13,
+                        const uint8_t* w2_codes, const uint8_t* w2_scales, float es2) {
+    if (layer < 0 || layer >= MAX_LAYERS || e < 0 || e > 127 || !w13_codes || !w13_scales || !w2_codes || !w2_scales) return;
+    LayerBanks* lb = &g.layers[layer];
+    if (!lb->w13_codes) {
+        // First expert of a layer that has no host bank: every other expert points at this one, so a request naming
+        // an expert this side does not hold reads valid memory (wrong numbers, never a fault).
+        lb->w13_codes = w13_codes;
+        lb->w13_scales = w13_scales;
+        lb->w2_codes = w2_codes;
+        lb->w2_scales = w2_scales;
+        for (int i = 0; i < 128; ++i) {
+            lb->xp[i][0] = w13_codes;
+            lb->xp[i][1] = w13_scales;
+            lb->xp[i][2] = w2_codes;
+            lb->xp[i][3] = w2_scales;
+            lb->es13[i] = es13;
+            lb->es2[i] = es2;
+        }
+    }
+    lb->xp[e][0] = w13_codes;
+    lb->xp[e][1] = w13_scales;
+    lb->xp[e][2] = w2_codes;
+    lb->xp[e][3] = w2_scales;
+    lb->es13[e] = es13;
+    lb->es2[e] = es2;
 }
 
 // cpus: optional list of n_threads CPU ids to pin thread i to (NULL = thread i on CPU i; -1 entries = unpinned).

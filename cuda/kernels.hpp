@@ -110,9 +110,11 @@ void launch_moe_slots_list_h(
     const ExpertBank& w2h, const __half* x_h, const float* route_w, __half* act_h, float* out_down, const int32_t* glist,
     cudaStream_t stream);
 
-// Decode expert cache tail slots (MOE_TAIL_TAG | t): w13[t] / w2[t] = device address of slot t's w13 / w2 data (each
-// followed by its block scales); the slot's expert scale is the cache bank's expert_scale[wf_off + t]. Synchronous.
-cudaError_t set_moe_tail_slots(const void* const* w13, const void* const* w2, int n, int wf_off);
+// Decode expert cache pointer-table slots (MOE_TAIL_TAG | t: KV-tail and hole slots): w13[t] / w13s[t] / w2[t] /
+// w2s[t] = device address of slot t's w13 data, w13 block scales, w2 data, w2 block scales; the slot's expert scale
+// is the cache bank's expert_scale[wf_off + t]. Synchronous.
+cudaError_t set_moe_tail_slots(const void* const* w13, const void* const* w13s, const void* const* w2,
+                               const void* const* w2s, int n, int wf_off);
 
 // MoE Down + Weighted Top-K Reduction (reads half act!)
 void launch_moe_down_h(

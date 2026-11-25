@@ -431,7 +431,7 @@ pub extern "c" fn squid_launch_cpu_moe_wait_add(shared_dev: *anyopaque, seq_ctr:
 pub extern "c" fn squid_launch_moe_slots_list_h(w13: *const CExpertBank, w2: *const CExpertBank, w13b: *const CExpertBank, w2b: *const CExpertBank, w13h: *const CExpertBank, w2h: *const CExpertBank, x_h: *const anyopaque, route_w: [*]const f32, act_h: *anyopaque, out_down: [*]f32, glist: [*]const i32, stream: ?*anyopaque) void;
 pub extern "c" fn squid_launch_cpu_moe_post_cache(x_h: *const anyopaque, ids: [*]const i32, wts: [*]const f32, shared_dev: *anyopaque, seq_ctr: [*]u32, layer: i32, cmap_l: [*]const i32, glist: [*]i32, hist_l: ?[*]u32, pcie_h: i32, stream: ?*anyopaque) void;
 pub extern "c" fn squid_launch_cpu_moe_wait_add_if(shared_dev: *anyopaque, seq_ctr: [*]const u32, out: [*]f32, err: [*]i32, posted: [*]const i32, stream: ?*anyopaque) void;
-pub extern "c" fn squid_set_moe_tail_slots(w13: [*]const ?*const anyopaque, w2: [*]const ?*const anyopaque, n: i32, wf_off: i32) i32;
+pub extern "c" fn squid_set_moe_tail_slots(w13: [*]const ?*const anyopaque, w13s: [*]const ?*const anyopaque, w2: [*]const ?*const anyopaque, w2s: [*]const ?*const anyopaque, n: i32, wf_off: i32) i32;
 pub extern "c" fn squid_launch_moe_slots_h(w13: *const CExpertBank, w2: *const CExpertBank, x_h: *const anyopaque, route_ids: [*]const i32, route_w: [*]const f32, act_h: *anyopaque, out_down: [*]f32, kslots: i32, k_split: i32, stream: ?*anyopaque) void;
 pub extern "c" fn squid_launch_cpu_moe_exchange(
     x_h: *const anyopaque,
@@ -453,6 +453,16 @@ pub extern "c" fn cpu_moe_set_layer(
     w2_codes: [*]const u8,
     w2_scales: [*]const u8,
     es2: [*]const f32,
+) void;
+pub extern "c" fn cpu_moe_set_expert(
+    layer: c_int,
+    e: c_int,
+    w13_codes: [*]const u8,
+    w13_scales: [*]const u8,
+    es13: f32,
+    w2_codes: [*]const u8,
+    w2_scales: [*]const u8,
+    es2: f32,
 ) void;
 pub extern "c" fn cpu_moe_start(shared_host: *anyopaque, n_threads: c_int, cpus: ?[*]const c_int) c_int;
 pub extern "c" fn cpu_moe_kick() void;

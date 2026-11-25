@@ -761,8 +761,9 @@ void squid_launch_moe_slots_h(
                        static_cast<__half*>(act_h), out_down, kslots, k_split, static_cast<cudaStream_t>(stream));
 }
 
-int squid_set_moe_tail_slots(const void* const* w13, const void* const* w2, int n, int wf_off) {
-    return static_cast<int>(set_moe_tail_slots(w13, w2, n, wf_off));
+int squid_set_moe_tail_slots(const void* const* w13, const void* const* w13s, const void* const* w2,
+                             const void* const* w2s, int n, int wf_off) {
+    return static_cast<int>(set_moe_tail_slots(w13, w13s, w2, w2s, n, wf_off));
 }
 
 void squid_launch_moe_slots_list_h(

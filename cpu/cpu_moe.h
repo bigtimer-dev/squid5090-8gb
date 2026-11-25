@@ -38,6 +38,9 @@ typedef struct CpuMoeShared {
 int cpu_moe_available(void);
 void cpu_moe_set_layer(int layer, const uint8_t* w13_codes, const uint8_t* w13_scales, const float* es13,
                        const uint8_t* w2_codes, const uint8_t* w2_scales, const float* es2);
+// One expert from its own host copy (a demoted expert of a VRAM-resident layer; see SQUID_DECODE_CACHE_DEMOTE).
+void cpu_moe_set_expert(int layer, int e, const uint8_t* w13_codes, const uint8_t* w13_scales, float es13,
+                        const uint8_t* w2_codes, const uint8_t* w2_scales, float es2);
 int cpu_moe_start(CpuMoeShared* shared_host, int n_threads, const int* cpus);
 void cpu_moe_kick(void);
 void cpu_moe_stop(void);

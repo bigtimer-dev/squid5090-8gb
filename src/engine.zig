@@ -227,6 +227,23 @@ pub const Engine = struct {
     dcache_tail_margin: u32 = 0,
     dcache_tail_evicts: u64 = 0,
     dcache_tail_check: bool = false,
+    // SQUID_DECODE_CACHE_DEMOTE=k: the k coldest experts (by the prior) of the VRAM-resident layers are computed by the
+    // CPU from pinned host copies; their regions of the VRAM banks ("holes") become k more cache slots for the
+    // CPU-served layers: slots [nab, tb) (pointer-table slots, MOE_TAIL_TAG like the KV tails, which follow at
+    // [tb, n)). A decode visit of a layer with demoted experts takes the cache path (resident experts are entries
+    // MOE_HOST_TAG | e of the layer's own VRAM bank, no PCIe slot). Prefill and B > 1 passes read the VRAM banks
+    // whole, so dcache_holes_restore copies the demoted experts back (end of every request, and before any prefill
+    // if still needed) and ensure_decode_cache re-uploads the hole slots (like bank A). SQUID_DECODE_CACHE_HOLE_CHECK=1
+    // compares every hole with its host copy after each restore.
+    dcache_nh: u32 = 0,
+    dcache_tb: u32 = 0,
+    dcache_hole_ptr: [][4]usize = &.{},
+    dcache_demote_layers: u32 = 0,
+    dcache_demoted: [constants.layer_count]u128 = @splat(0),
+    dcache_demote_host: ?*anyopaque = null,
+    dcache_holes_dirty: bool = false,
+    dcache_hole_restores: u64 = 0,
+    dcache_hole_check: bool = false,
     dcache_valid: bool = false,
     dcache_layers: u32 = 0,
     dcache_w13: cuda.CExpertBank = .{},
@@ -803,15 +820,26 @@ pub const Engine = struct {
         // the least-used of them).
         const nab: usize = n;
         self.dcache_nab = @intCast(nab);
+        if (tiger.getenv("SQUID_DECODE_CACHE_DEMOTE")) |v| {
+            const want = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0;
+            if (want > 0 and w.dspark.loaded != 0) {
+                tiger.print_stdout("[dcache] demotion needs --mtp 0 (the drafter's passes read the VRAM banks whole); off\n", .{});
+            } else if (want > 0) {
+                n += self.dcache_demote_setup(&prior, @min(want, nc - nab), per_expert);
+            }
+            if (tiger.getenv("SQUID_DECODE_CACHE_HOLE_CHECK")) |cv| self.dcache_hole_check = cv[0] == '1';
+        }
+        self.dcache_tb = @intCast(n);
         if (tiger.getenv("SQUID_DECODE_CACHE_TAIL")) |v| {
             const want = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0;
             if (want > 0 and w.dspark.loaded != 0) {
                 tiger.print_stdout("[dcache] tail slots need --mtp 0 (the drafter's decode path does not guard them); off\n", .{});
             } else if (want > 0) {
-                n += self.dcache_tail_layout(per_expert, @min(want, nc - nab));
+                n += self.dcache_tail_layout(per_expert, @min(want, nc - n));
             }
             if (tiger.getenv("SQUID_DECODE_CACHE_TAIL_CHECK")) |cv| self.dcache_tail_check = cv[0] == '1';
         }
+        self.dcache_set_slot_table();
         if (n == 0) {
             tiger.print_stdout("[dcache] no room ({d:.0} MiB); off\n", .{@as(f64, @floatFromInt(have)) / 1048576.0});
             return;
@@ -857,13 +885,15 @@ pub const Engine = struct {
         self.dcache_sel0 = pa.alloc(u16, n) catch unreachable;
         @memcpy(self.dcache_sel0, self.dcache_sel);
         self.dcache_tail_on = self.dcache_tail_count(0);
-        for (nab + self.dcache_tail_on..n) |c| {
+        for (self.dcache_tb + self.dcache_tail_on..n) |c| {
             const id = self.dcache_sel[c];
             const k: usize = @as(usize, id >> 8) * ne + (id & 0xff);
             cmap[k] = -1;
             self.dcache_cmap_h[k] = -1;
             self.dcache_sel[c] = 0xffff;
         }
+        self.dcache_apply_static(&cmap);
+        self.dcache_apply_static(self.dcache_cmap_h);
         self.dcache_prior = pa.alloc(f32, nn) catch unreachable;
         self.dcache_sess = pa.alloc(f32, nn) catch unreachable;
         self.dcache_hist_last = pa.alloc(u32, nn) catch unreachable;
@@ -958,16 +988,18 @@ pub const Engine = struct {
         self.dcache_layers = layers;
         self.dcache_n = @intCast(n);
         self.dcache_valid = false;
-        tiger.print_stdout("[dcache] B = 1 decode: {d} experts of layers mask 0x{x:0>6} cached, {d} in the prefill buffers ({d:.0} of {d:.0} MiB) + {d} in bank B ({d:.0} MiB); + {d} in KV tails ({d} usable at once, margin {d} positions); prior covers {d:.1}% of their routing\n", .{ n, layers, na, @as(f64, @floatFromInt(off)) / 1048576.0, @as(f64, @floatFromInt(have)) / 1048576.0, nab - na, @as(f64, @floatFromInt(per_expert * (nab - na))) / 1048576.0, n - nab, self.dcache_tail_on, self.dcache_tail_margin, if (total_cnt > 0) 100.0 * @as(f64, @floatFromInt(covered)) / @as(f64, @floatFromInt(total_cnt)) else 0.0 });
+        tiger.print_stdout("[dcache] B = 1 decode: {d} experts of layers mask 0x{x:0>6} cached, {d} in the prefill buffers ({d:.0} of {d:.0} MiB) + {d} in bank B ({d:.0} MiB); + {d} in VRAM-bank holes; + {d} in KV tails ({d} usable at once, margin {d} positions); prior covers {d:.1}% of their routing\n", .{ n, layers, na, @as(f64, @floatFromInt(off)) / 1048576.0, @as(f64, @floatFromInt(have)) / 1048576.0, nab - na, @as(f64, @floatFromInt(per_expert * (nab - na))) / 1048576.0, self.dcache_nh, n - self.dcache_tb, self.dcache_tail_on, self.dcache_tail_margin, if (total_cnt > 0) 100.0 * @as(f64, @floatFromInt(covered)) / @as(f64, @floatFromInt(total_cnt)) else 0.0 });
     }
 
     /// Device address of array k (w13 data, w13 scales, w2 data, w2 scales) of cache slot c.
     fn dcache_slot_ptr(self: *const Engine, k: usize, c: usize) [*]u8 {
         const sz: usize = @intCast(self.dcache_esz[k]);
         if (c >= self.dcache_nab) {
+            const t: usize = c - self.dcache_nab;
+            if (t < self.dcache_nh) return @ptrFromInt(self.dcache_hole_ptr[t][k]);
             var off: usize = 0;
             for (0..k) |i| off += @intCast(self.dcache_esz[i]);
-            return @ptrFromInt(self.dcache_tail_ptr[c - self.dcache_nab] + off);
+            return @ptrFromInt(self.dcache_tail_ptr[t - self.dcache_nh] + off);
         }
         return if (c < self.dcache_na) self.dcache_dst[k].? + c * sz else self.dcache_dstb[k].? + (c - self.dcache_na) * sz;
     }
@@ -1006,6 +1038,7 @@ pub const Engine = struct {
         tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
         self.dcache_upload_ns += tiger.clock_monotonic_ns() - t0;
         self.dcache_uploads += 1;
+        if (self.dcache_nh > 0) self.dcache_holes_dirty = true;
         self.dcache_valid = true;
     }
 
@@ -1102,9 +1135,10 @@ pub const Engine = struct {
         const ne = constants.expert_count;
         @memset(self.dcache_sess, 0);
         @memcpy(self.dcache_sel, self.dcache_sel0);
-        for (self.dcache_sel[self.dcache_nab + on ..]) |*x| x.* = 0xffff;
+        for (self.dcache_sel[self.dcache_tb + on ..]) |*x| x.* = 0xffff;
         self.dcache_tail_on = on;
         @memset(self.dcache_cmap_h, -1);
+        self.dcache_apply_static(self.dcache_cmap_h);
         const n: usize = self.dcache_n;
         for (self.dcache_sel, 0..) |id, c| {
             if (id == 0xffff) continue;
@@ -1127,9 +1161,10 @@ pub const Engine = struct {
     fn dcache_restore_persistent(self: *Engine) void {
         if (self.dcache_n == 0 or self.dcache_adapt_n == 0 or !self.dcache_adapt_reset) return;
         const w = self.weights.?;
-        const end: usize = self.dcache_nab + self.dcache_tail_on;
+        const end: usize = self.dcache_tb + self.dcache_tail_on;
         var queued: bool = false;
         for (self.dcache_na..end) |c| {
+            if (c >= self.dcache_nab and c < self.dcache_tb) continue;
             const id = self.dcache_sel0[c];
             if (id == 0xffff or self.dcache_loaded[c - self.dcache_na] == id) continue;
             self.dcache_loaded[c - self.dcache_na] = id;
@@ -1191,21 +1226,189 @@ pub const Engine = struct {
         const pa = std.heap.page_allocator;
         self.dcache_tail_pos = pa.alloc(u32, nt) catch unreachable;
         self.dcache_tail_ptr = pa.alloc(usize, nt) catch unreachable;
-        var up: [256]?*const anyopaque = @splat(null);
-        var dn: [256]?*const anyopaque = @splat(null);
-        const o2: usize = @intCast(self.dcache_esz[0] + self.dcache_esz[1]);
         for (0..nt) |t| {
             self.dcache_tail_pos[t] = pos[ord[t]];
             self.dcache_tail_ptr[t] = ptr[ord[t]];
-            up[t] = @ptrFromInt(self.dcache_tail_ptr[t]);
-            dn[t] = @ptrFromInt(self.dcache_tail_ptr[t] + o2);
         }
         // Prefill chunks end at the prompt end (prefill_range / prefill_final_range clip them); B <= 8 forward passes and
         // decode steps write and read at most a block past the current position.
         self.dcache_tail_margin = 64;
-        tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
-        tiger.assert_cuda(cuda.squid_set_moe_tail_slots(&up, &dn, @intCast(nt), @intCast(self.dcache_nab)));
         return nt;
+    }
+
+    /// The kernels' pointer-table slots (MOE_TAIL_TAG | t): the holes [0, nh), then the KV tails.
+    fn dcache_set_slot_table(self: *Engine) void {
+        const nh: usize = self.dcache_nh;
+        const nt: usize = self.dcache_tail_ptr.len;
+        if (nh + nt == 0) return;
+        const max_t = 640; // MOE_TAIL_MAX (kernels_gemv.cu)
+        tiger.assert(nh + nt <= max_t);
+        var t13: [max_t]?*const anyopaque = @splat(null);
+        var t13s: [max_t]?*const anyopaque = @splat(null);
+        var t2: [max_t]?*const anyopaque = @splat(null);
+        var t2s: [max_t]?*const anyopaque = @splat(null);
+        for (0..nh) |t| {
+            t13[t] = @ptrFromInt(self.dcache_hole_ptr[t][0]);
+            t13s[t] = @ptrFromInt(self.dcache_hole_ptr[t][1]);
+            t2[t] = @ptrFromInt(self.dcache_hole_ptr[t][2]);
+            t2s[t] = @ptrFromInt(self.dcache_hole_ptr[t][3]);
+        }
+        const o1: usize = @intCast(self.dcache_esz[0]);
+        const o2: usize = o1 + @as(usize, @intCast(self.dcache_esz[1]));
+        const o3: usize = o2 + @as(usize, @intCast(self.dcache_esz[2]));
+        for (0..nt) |j| {
+            const p = self.dcache_tail_ptr[j];
+            t13[nh + j] = @ptrFromInt(p);
+            t13s[nh + j] = @ptrFromInt(p + o1);
+            t2[nh + j] = @ptrFromInt(p + o2);
+            t2s[nh + j] = @ptrFromInt(p + o3);
+        }
+        tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+        tiger.assert_cuda(cuda.squid_set_moe_tail_slots(&t13, &t13s, &t2, &t2s, @intCast(nh + nt), @intCast(self.dcache_nab)));
+    }
+
+    /// Demotion setup (SQUID_DECODE_CACHE_DEMOTE): picks the `want` coldest experts of the VRAM-resident layers, copies
+    /// them to pinned host RAM, hands them to the CPU worker and records their VRAM regions as hole slots. Returns the
+    /// hole count.
+    fn dcache_demote_setup(self: *Engine, prior: *const [constants.layer_count * constants.expert_count]u32, want: usize, per_expert: u64) usize {
+        const w = self.weights.?;
+        const ne = constants.expert_count;
+        const lw0 = &w.layers[@ctz(self.cpu_moe_layers)];
+        var cand: [constants.layer_count * constants.expert_count]u32 = undefined;
+        var nc: usize = 0;
+        var l: u32 = 0;
+        while (l < constants.layer_count) : (l += 1) {
+            if ((self.cpu_moe_layers >> @intCast(l)) & 1 == 1) continue;
+            if (weights_mod.bank_on_host(w.host_expert_banks, l, 0) or weights_mod.bank_on_host(w.host_expert_banks, l, 1)) continue;
+            const lw = &w.layers[l];
+            if (lw.w13.is_nvfp4 == 0 or lw.w2.is_nvfp4 == 0 or lw.w13.data == null or lw.w13.expert_scale == null or lw.w2.expert_scale == null) continue;
+            if (lw.w13.rows != lw0.w13.rows or lw.w13.cols != lw0.w13.cols or lw.w2.rows != lw0.w2.rows or lw.w2.cols != lw0.w2.cols) continue;
+            for (0..ne) |e| {
+                cand[nc] = l * ne + @as(u32, @intCast(e));
+                nc += 1;
+            }
+        }
+        // coldest first; ties: higher (layer, expert) first
+        const Ctx = struct {
+            p: *const [constants.layer_count * constants.expert_count]u32,
+            fn lt(ctx: @This(), x: u32, y: u32) bool {
+                if (ctx.p[x] != ctx.p[y]) return ctx.p[x] < ctx.p[y];
+                return x > y;
+            }
+        };
+        std.sort.pdq(u32, cand[0..nc], Ctx{ .p = prior }, Ctx.lt);
+        const k: usize = @min(@min(want, nc), 384);
+        if (k == 0) return 0;
+        std.sort.pdq(u32, cand[0..k], {}, std.sort.asc(u32));
+        var host: ?*anyopaque = null;
+        const host_bytes: u64 = per_expert * @as(u64, @intCast(k));
+        if (cuda.squid_cuda_malloc_host_pinned(&host, @intCast(host_bytes), 0) != 0 or host == null) {
+            tiger.print_stdout("[dcache] demotion: cannot pin {d} MiB of host RAM; off\n", .{host_bytes / 1048576});
+            return 0;
+        }
+        self.dcache_demote_host = host;
+        const hb: [*]u8 = @ptrCast(host.?);
+        const pa = std.heap.page_allocator;
+        self.dcache_hole_ptr = pa.alloc([4]usize, k) catch unreachable;
+        var es13: [constants.expert_count]f32 = undefined;
+        var es2: [constants.expert_count]f32 = undefined;
+        var cur_l: u32 = 0xffff;
+        var cold: u64 = 0;
+        var total: u64 = 0;
+        for (cand[0..k], 0..) |id, t| {
+            const dl: u32 = id / ne;
+            const de: usize = id % ne;
+            const lw = &w.layers[dl];
+            if (dl != cur_l) {
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h(@ptrCast(&es13), @ptrCast(lw.w13.expert_scale.?), @sizeOf(@TypeOf(es13))));
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h(@ptrCast(&es2), @ptrCast(lw.w2.expert_scale.?), @sizeOf(@TypeOf(es2))));
+                cur_l = dl;
+            }
+            const bases = [4]usize{ @intFromPtr(lw.w13.data.?), @intFromPtr(lw.w13.scales.?), @intFromPtr(lw.w2.data.?), @intFromPtr(lw.w2.scales.?) };
+            var off: usize = 0;
+            var hp: [4][*]const u8 = undefined;
+            for (0..4) |a| {
+                const sz: usize = @intCast(self.dcache_esz[a]);
+                self.dcache_hole_ptr[t][a] = bases[a] + de * sz;
+                const dst: [*]u8 = hb + t * @as(usize, @intCast(per_expert)) + off;
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h(@ptrCast(dst), @ptrFromInt(self.dcache_hole_ptr[t][a]), sz));
+                hp[a] = dst;
+                off += sz;
+            }
+            cuda.cpu_moe_set_expert(@intCast(dl), @intCast(de), hp[0], hp[1], es13[de], hp[2], hp[3], es2[de]);
+            self.dcache_demoted[dl] |= @as(u128, 1) << @intCast(de);
+            self.dcache_demote_layers |= @as(u32, 1) << @intCast(dl);
+            cold += prior[id];
+        }
+        l = 0;
+        while (l < constants.layer_count) : (l += 1) {
+            if ((self.dcache_demote_layers >> @intCast(l)) & 1 == 0) continue;
+            for (0..ne) |e| total += prior[l * ne + e];
+        }
+        self.dcache_nh = @intCast(k);
+        self.dcache_holes_dirty = false;
+        tiger.print_stdout("[dcache] demoted the {d} coldest experts of layers mask 0x{x:0>6} to the CPU ({d:.1}% of those layers' prior routing; {d:.0} MiB pinned host copies); their VRAM holds {d} more cache slots\n", .{ k, self.dcache_demote_layers, if (total > 0) 100.0 * @as(f64, @floatFromInt(cold)) / @as(f64, @floatFromInt(total)) else 0.0, @as(f64, @floatFromInt(host_bytes)) / 1048576.0, k });
+        return k;
+    }
+
+    /// cmap rows of the layers with demoted experts (static): resident expert e -> MOE_HOST_TAG | e (the layer's own
+    /// VRAM bank), demoted -> -1 (CPU).
+    fn dcache_apply_static(self: *const Engine, cm: []i32) void {
+        if (self.dcache_demote_layers == 0) return;
+        const ne = constants.expert_count;
+        var l: u32 = 0;
+        while (l < constants.layer_count) : (l += 1) {
+            if ((self.dcache_demote_layers >> @intCast(l)) & 1 == 0) continue;
+            for (0..ne) |e| {
+                const dem = (self.dcache_demoted[l] >> @intCast(e)) & 1 == 1;
+                cm[l * ne + e] = if (dem) -1 else @as(i32, (1 << 16) | @as(i32, @intCast(e)));
+            }
+        }
+    }
+
+    /// Copy the demoted experts back into their holes (queued on the stream) so that prefill and B > 1 passes see
+    /// whole VRAM banks; the hole slots are re-uploaded by the next ensure_decode_cache.
+    fn dcache_holes_restore(self: *Engine) void {
+        if (self.dcache_nh == 0 or !self.dcache_holes_dirty) return;
+        const hb: [*]const u8 = @ptrCast(self.dcache_demote_host.?);
+        const pe: usize = @intCast(self.dcache_esz[0] + self.dcache_esz[1] + self.dcache_esz[2] + self.dcache_esz[3]);
+        for (0..self.dcache_nh) |t| {
+            var off: usize = 0;
+            for (0..4) |a| {
+                const sz: usize = @intCast(self.dcache_esz[a]);
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_default_async(@ptrFromInt(self.dcache_hole_ptr[t][a]), @ptrCast(hb + t * pe + off), sz, self.stream));
+                off += sz;
+            }
+            self.dcache_loaded[self.dcache_nab + t - self.dcache_na] = 0xffff;
+        }
+        self.dcache_holes_dirty = false;
+        self.dcache_valid = false;
+        self.dcache_hole_restores += 1;
+        if (self.dcache_hole_check) self.dcache_hole_verify();
+    }
+
+    /// SQUID_DECODE_CACHE_HOLE_CHECK=1: compare every restored hole with its host copy (slow; for testing).
+    fn dcache_hole_verify(self: *Engine) void {
+        tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+        const pa = std.heap.page_allocator;
+        const buf = pa.alloc(u8, @intCast(self.dcache_esz[0])) catch unreachable;
+        defer pa.free(buf);
+        const hb: [*]const u8 = @ptrCast(self.dcache_demote_host.?);
+        const pe: usize = @intCast(self.dcache_esz[0] + self.dcache_esz[1] + self.dcache_esz[2] + self.dcache_esz[3]);
+        var bad: u32 = 0;
+        for (0..self.dcache_nh) |t| {
+            var off: usize = 0;
+            for (0..4) |a| {
+                const sz: usize = @intCast(self.dcache_esz[a]);
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h(@ptrCast(buf.ptr), @ptrFromInt(self.dcache_hole_ptr[t][a]), sz));
+                if (!std.mem.eql(u8, buf[0..sz], hb[t * pe + off .. t * pe + off + sz])) {
+                    bad += 1;
+                    break;
+                }
+                off += sz;
+            }
+        }
+        tiger.print_stdout("[dcache] hole check after restore {d}: {d} of {d} holes intact\n", .{ self.dcache_hole_restores, self.dcache_nh - bad, self.dcache_nh });
     }
 
     /// Tail slots usable when KV positions [0, hi) may be live or written.
@@ -1226,7 +1429,7 @@ pub const Engine = struct {
         const pe: usize = @intCast(self.dcache_esz[0] + self.dcache_esz[1] + self.dcache_esz[2] + self.dcache_esz[3]);
         var t: u32 = on;
         while (t < self.dcache_tail_on) : (t += 1) {
-            const c: usize = self.dcache_nab + t;
+            const c: usize = self.dcache_tb + t;
             const id = self.dcache_sel[c];
             if (id != 0xffff) {
                 self.dcache_cmap_h[@as(usize, id >> 8) * ne + (id & 0xff)] = -1;
@@ -1248,7 +1451,7 @@ pub const Engine = struct {
         const n: usize = self.dcache_n;
         var t: u32 = self.dcache_tail_on;
         while (t < on) : (t += 1) {
-            const c: usize = self.dcache_nab + t;
+            const c: usize = self.dcache_tb + t;
             const id = self.dcache_sel0[c];
             const k: usize = @as(usize, id >> 8) * ne + (id & 0xff);
             if (self.dcache_cmap_h[k] >= 0) continue;
@@ -1275,7 +1478,7 @@ pub const Engine = struct {
         var bad: u32 = 0;
         var t: u32 = 0;
         while (t < self.dcache_tail_on) : (t += 1) {
-            const c: usize = self.dcache_nab + t;
+            const c: usize = self.dcache_tb + t;
             const id = self.dcache_sel[c];
             if (id == 0xffff) continue;
             checked += 1;
@@ -1581,6 +1784,7 @@ pub const Engine = struct {
             if (self.dcache_uploads > 0) tiger.print_stdout("[dcache] {d} uploads of {d} experts, avg {d:.1} ms\n", .{ self.dcache_uploads, self.dcache_n, @as(f64, @floatFromInt(self.dcache_upload_ns)) / @as(f64, @floatFromInt(self.dcache_uploads)) / 1e6 });
             if (self.dcache_adapt_steps > 0) tiger.print_stdout("[dcache] adaptive: {d} steps, {d} swaps ({d:.2} per step)\n", .{ self.dcache_adapt_steps, self.dcache_swaps, @as(f64, @floatFromInt(self.dcache_swaps)) / @as(f64, @floatFromInt(self.dcache_adapt_steps)) });
             if (self.dcache_tail_pos.len > 0) tiger.print_stdout("[dcache] tail slots: {d}, {d} usable at exit, switched off {d} times\n", .{ self.dcache_tail_pos.len, self.dcache_tail_on, self.dcache_tail_evicts });
+            if (self.dcache_nh > 0) tiger.print_stdout("[dcache] hole slots: {d}, restored {d} times\n", .{ self.dcache_nh, self.dcache_hole_restores });
             if (self.dcache_hist) |p| tiger.assert_cuda(cuda.squid_cuda_free(@ptrCast(p)));
             const pa = std.heap.page_allocator;
             pa.free(self.dcache_hist_last);
@@ -1600,6 +1804,11 @@ pub const Engine = struct {
                 pa.free(self.dcache_tail_ptr);
             }
             if (self.dcache_regb) |p| tiger.assert_cuda(cuda.squid_cuda_free(p));
+            if (self.dcache_nh > 0) {
+                pa.free(self.dcache_hole_ptr);
+                if (self.dcache_demote_host) |p| tiger.assert_cuda(cuda.squid_cuda_free_host(p));
+                self.dcache_nh = 0;
+            }
             self.dcache_n = 0;
         }
         self.deinit_route_trace();
@@ -2313,11 +2522,13 @@ pub const Engine = struct {
             }
         }
         self.dcache_restore_persistent(); // queued behind the checkpoint copies; runs while the answer goes out
+        self.dcache_holes_restore(); // likewise: the next request's prefill needs whole VRAM banks
         return stats;
     }
 
     fn prefill_range(self: *Engine, prompt: []const i32, start_i: u32, end_i: u32, use_mtp: bool, compute_last_lm: bool) u32 {
         tiger.assert(end_i >= start_i);
+        self.dcache_holes_restore();
         var i: u32 = start_i;
         // Fast batched Tensor Core + multi-token MoE prefill (chunks of 32..256, multiples of 8)
         while (end_i - i >= 32 and (!compute_last_lm or end_i - i > 32)) {
@@ -2356,6 +2567,7 @@ pub const Engine = struct {
 
     fn prefill_final_range(self: *Engine, prompt: []const i32, start_i: u32, prompt_len: u32, use_mtp: bool) u32 {
         tiger.assert(start_i < prompt_len);
+        self.dcache_holes_restore(); // its B <= 8 passes (graph or not) read the VRAM banks whole
         var i: u32 = start_i;
         // Fast batched Tensor Core + multi-token MoE prefill leaving 1..31 tokens for final lm_head chunk
         while (prompt_len - i > 32) {
@@ -2400,6 +2612,7 @@ pub const Engine = struct {
     fn prefill_chunk_batched(self: *Engine, prompt: []const i32, start_i: u32, chunk_len: u32, commit_dspark: bool) void {
         tiger.assert(chunk_len >= 8 and chunk_len <= self.prefill_cap and (chunk_len % 8 == 0));
         self.dbank_valid = false; // the prefill buffers hold the decode bank / cache between prefills
+        self.dcache_holes_restore();
         self.dcache_valid = false;
         const w = self.weights.?;
         const b_i32: i32 = @intCast(chunk_len);
@@ -2958,7 +3171,7 @@ pub const Engine = struct {
         if (self.dcache_tail_pos.len > 0) {
             // decode at sim_pos (+ iterations); the memset below also clears the tail slots: re-upload the usable ones
             self.reset_decode_cache_session(@as(u32, @intCast(sim_pos)) + iterations + 8);
-            for (0..self.dcache_tail_pos.len) |t| self.dcache_loaded[self.dcache_nab + t - self.dcache_na] = 0xffff;
+            for (0..self.dcache_tail_pos.len) |t| self.dcache_loaded[self.dcache_tb + t - self.dcache_na] = 0xffff;
             self.dcache_valid = false;
         }
 
@@ -3412,8 +3625,12 @@ pub const Engine = struct {
             }
 
             const use_dbank: bool = batch_size == 1 and self.dbank_use and @as(i32, @intCast(l)) == self.dbank_layer;
-            const cpu_visit: bool = batch_size == 1 and (self.cpu_moe_layers >> @intCast(l)) & 1 == 1 and !use_dbank;
-            const use_dcache: bool = cpu_visit and self.dbank_use and (self.dcache_layers >> @intCast(l)) & 1 == 1;
+            // A layer with demoted experts takes the cache path only in B = 1 decode (dbank_use); every other pass reads
+            // its VRAM bank whole (restored by dcache_holes_restore).
+            const demoted_l: bool = batch_size == 1 and self.dbank_use and (self.dcache_demote_layers >> @intCast(l)) & 1 == 1;
+            const cpu_visit: bool = batch_size == 1 and ((self.cpu_moe_layers >> @intCast(l)) & 1 == 1 or demoted_l) and !use_dbank;
+            const use_dcache: bool = cpu_visit and self.dbank_use and ((self.dcache_layers >> @intCast(l)) & 1 == 1 or demoted_l);
+            const pcie_h: i32 = if (demoted_l) -1 else self.dcache_pcie_h;
             // B = 1: one launch computes the logits, picks the top 8 and, on a decode-cache host visit, posts the CPU's
             // request (bit-identical to the three launches it replaces).
             const fused_route: bool = w.mode == .nvfp4 and batch_size == 1 and self.route_fused;
@@ -3433,7 +3650,7 @@ pub const Engine = struct {
                     if (fused_post) self.dcache_cmap.? + @as(usize, l) * constants.expert_count else null,
                     if (fused_post) self.dcache_glist.? else null,
                     if (fused_post) (if (self.dcache_hist) |h| h + @as(usize, l) * constants.expert_count else null) else null,
-                    self.dcache_pcie_h,
+                    pcie_h,
                     self.stream,
                 );
             } else if (w.mode == .nvfp4) {
@@ -3466,9 +3683,9 @@ pub const Engine = struct {
             }
             if (use_dcache) {
                 const gl = self.dcache_glist.?;
-                if (!fused_post) cuda.squid_launch_cpu_moe_post_cache(self.mlp_normed_h, self.route_ids, self.route_w, self.cpu_moe_sh_dev.?, self.cpu_moe_ctr.?, @intCast(l), self.dcache_cmap.? + @as(usize, l) * constants.expert_count, gl, if (self.dcache_hist) |h| h + @as(usize, l) * constants.expert_count else null, self.dcache_pcie_h, self.stream);
+                if (!fused_post) cuda.squid_launch_cpu_moe_post_cache(self.mlp_normed_h, self.route_ids, self.route_w, self.cpu_moe_sh_dev.?, self.cpu_moe_ctr.?, @intCast(l), self.dcache_cmap.? + @as(usize, l) * constants.expert_count, gl, if (self.dcache_hist) |h| h + @as(usize, l) * constants.expert_count else null, pcie_h, self.stream);
                 cuda.squid_launch_moe_slots_list_h(&self.dcache_w13, &self.dcache_w2, &self.dcache_w13b, &self.dcache_w2b, &lw.w13, &lw.w2, self.mlp_normed_h, self.route_w, self.moe_act_h, self.moe_down, gl, self.stream);
-                if (self.cpu_moe_l2pf > 0 and vi + 1 < constants.visit_count) self.launch_l2_prefetch_layer(&w.layers[self.schedule[vi + 1].physical_layer], gl + 17);
+                if (self.cpu_moe_l2pf > 0 and !demoted_l and vi + 1 < constants.visit_count) self.launch_l2_prefetch_layer(&w.layers[self.schedule[vi + 1].physical_layer], gl + 17);
                 cuda.squid_launch_cpu_moe_wait_add_if(self.cpu_moe_sh_dev.?, self.cpu_moe_ctr.?, self.moe_down, @ptrCast(self.cpu_moe_ctr.? + 1), gl + 17, self.stream);
             } else if (cpu_visit and self.cpu_moe_gpu_slots > 0) {
                 cuda.squid_launch_cpu_moe_post(self.mlp_normed_h, self.route_ids, self.route_w, self.cpu_moe_sh_dev.?, self.cpu_moe_ctr.?, @intCast(l), self.cpu_moe_gpu_slots, self.cpu_moe_gpu_ksplit, self.stream);

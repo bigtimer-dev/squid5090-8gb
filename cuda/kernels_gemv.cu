@@ -1360,10 +1360,12 @@ constexpr int MOE_HOST_TAG = 1 << 16;   // decode expert cache list: entry = MOE
 constexpr int MOE_BANK2_TAG = 1 << 17;  // MOE_BANK2_TAG | c -> slot c of the second (persistent) cache bank (wb, wsb, wfb)
 constexpr int MOE_IDX_MASK = MOE_HOST_TAG - 1;
 constexpr int MOE_TAIL_TAG = 1 << 18;   // MOE_TAIL_TAG | t -> tail slot t: one whole expert in the idle tail of a global KV array
-constexpr int MOE_TAIL_MAX = 256;
-// Tail slot bases (set_moe_tail_slots): c_moe_tail[0][t] = the slot's w13 data (its scales follow it), [1][t] = its w2
-// data (scales follow). Expert scale of slot t: wfactor[c_moe_tail_wf_off + t] (tail slots follow banks A and B there).
-__constant__ const uint8_t* c_moe_tail[2][MOE_TAIL_MAX];
+constexpr int MOE_TAIL_MAX = 640;
+// Pointer-table slots (set_moe_tail_slots): c_moe_tail[0..3][t] = slot t's w13 data, w13 scales, w2 data, w2 scales.
+// A KV-tail slot holds one whole expert back to back; a hole slot (SQUID_DECODE_CACHE_DEMOTE) is the four arrays'
+// regions of a demoted expert inside a VRAM-resident layer's bank. Expert scale of slot t: wfactor[c_moe_tail_wf_off
+// + t] (these slots follow banks A and B there).
+__constant__ const uint8_t* c_moe_tail[4][MOE_TAIL_MAX];
 __constant__ int c_moe_tail_wf_off;
 constexpr int MOE_UP_WARPS = HIDDEN / 128;         // 18 warps (576 threads)
 constexpr int MOE_DOWN_GROUPS = INTERMEDIATE / 128; // 9 column groups
@@ -1586,10 +1588,9 @@ moe_up_tc_persist_kernel(
         const uint8_t* pw;
         const uint8_t* ps;
         if (e & MOE_TAIL_TAG) {
-            const uint8_t* tb = c_moe_tail[0][e & MOE_IDX_MASK];
             const size_t r = (size_t)tile * MOE_TILE + g;
-            pw = tb + r * CB;
-            ps = tb + (size_t)R * CB + r * SB;
+            pw = c_moe_tail[0][e & MOE_IDX_MASK] + r * CB;
+            ps = c_moe_tail[1][e & MOE_IDX_MASK] + r * SB;
         } else {
             const size_t row = (size_t)(e & MOE_IDX_MASK) * R + tile * MOE_TILE + g;
             pw = (hst ? wh : b2 ? wb : w) + row * CB;
@@ -1864,10 +1865,9 @@ moe_down_tc_persist_kernel(
         const uint8_t* pw;
         const uint8_t* ps;
         if (e & MOE_TAIL_TAG) {
-            const uint8_t* tb = c_moe_tail[1][e & MOE_IDX_MASK];
             const size_t r = (size_t)tl * MOE_TILE + g;
-            pw = tb + r * CB;
-            ps = tb + (size_t)R * CB + r * SB;
+            pw = c_moe_tail[2][e & MOE_IDX_MASK] + r * CB;
+            ps = c_moe_tail[3][e & MOE_IDX_MASK] + r * SB;
         } else {
             const size_t row = (size_t)(e & MOE_IDX_MASK) * R + tl * MOE_TILE + g;
             pw = (hst ? wh : b2 ? wb : w) + row * CB;
@@ -2159,12 +2159,17 @@ void launch_moe_slots_list_h(
 }
 
 
-cudaError_t set_moe_tail_slots(const void* const* w13, const void* const* w2, int n, int wf_off) {
+cudaError_t set_moe_tail_slots(const void* const* w13, const void* const* w13s, const void* const* w2,
+                               const void* const* w2s, int n, int wf_off) {
     if (n < 0 || n > MOE_TAIL_MAX) return cudaErrorInvalidValue;
-    const uint8_t* tbl[2][MOE_TAIL_MAX] = {};
+    static const uint8_t* tbl[4][MOE_TAIL_MAX];
+    for (auto& row : tbl)
+        for (auto& q : row) q = nullptr;
     for (int i = 0; i < n; ++i) {
         tbl[0][i] = static_cast<const uint8_t*>(w13[i]);
-        tbl[1][i] = static_cast<const uint8_t*>(w2[i]);
+        tbl[1][i] = static_cast<const uint8_t*>(w13s[i]);
+        tbl[2][i] = static_cast<const uint8_t*>(w2[i]);
+        tbl[3][i] = static_cast<const uint8_t*>(w2s[i]);
     }
     cudaError_t e = cudaMemcpyToSymbol(c_moe_tail, tbl, sizeof(tbl));
     if (e != cudaSuccess) return e;
