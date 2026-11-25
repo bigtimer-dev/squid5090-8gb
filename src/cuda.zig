@@ -101,6 +101,7 @@ pub extern "c" fn squid_cuda_event_create(out_event: *?*anyopaque, disable_timin
 pub extern "c" fn squid_cuda_event_destroy(ev: ?*anyopaque) i32;
 pub extern "c" fn squid_cuda_event_record(ev: ?*anyopaque, stream: ?*anyopaque) i32;
 pub extern "c" fn squid_cuda_event_sync(ev: ?*anyopaque) i32;
+pub extern "c" fn squid_cuda_event_query(ev: ?*anyopaque) i32; // 0 done, 1 not ready, else error
 pub extern "c" fn squid_cuda_event_elapsed_ms(out_ms: *f32, ev0: ?*anyopaque, ev1: ?*anyopaque) i32;
 pub extern "c" fn squid_cuda_stream_wait_event(stream: ?*anyopaque, ev: ?*anyopaque) i32;
 pub extern "c" fn squid_cuda_graph_begin(stream: ?*anyopaque) i32;

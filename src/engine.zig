@@ -244,6 +244,27 @@ pub const Engine = struct {
     dcache_holes_dirty: bool = false,
     dcache_hole_restores: u64 = 0,
     dcache_hole_check: bool = false,
+    // SQUID_DECODE_CACHE_LAZY=1: ensure_decode_cache lists the slot uploads and decoding starts at once; the copies
+    // run on aux_stream in chunks (one event each, at most lazy_inflight experts queued ahead of the landed ones, so
+    // the copy queue never blocks the host) and each landed chunk switches its experts on in the cmap at a token
+    // boundary. Until then they are "not cached" (the CPU computes them).
+    dcache_lazy: bool = false,
+    dcache_lazy_armed: bool = false, // set by generate around its ensure_decode_bank (the only caller that polls)
+    dcache_fill_fork: ?*anyopaque = null,
+    dcache_fill_last: ?*anyopaque = null, // the join's event
+    dcache_fill_evs: [lazy_ring]?*anyopaque = @splat(null),
+    dcache_fill_end: [lazy_ring]usize = @splat(0), // pend index after the chunk each event closes
+    dcache_fill_head: usize = 0, // events [head, tail) in flight (ring indices mod lazy_ring)
+    dcache_fill_tail: usize = 0,
+    dcache_pend: []u32 = &.{}, // k * 4096 + slot of each listed upload
+    dcache_npend: usize = 0, // uploads of the fill in progress (0 = none)
+    dcache_pq: usize = 0, // queued
+    dcache_pc: usize = 0, // switched on
+    dcache_lazy_fills: u64 = 0,
+    dcache_lazy_tokens: u64 = 0, // token boundaries with a fill still in flight
+    dcache_lazy_late: u64 = 0, // fills joined (still in flight at the end of decode or at a tail guard)
+    dcache_lazy_fill_ms: f64 = 0, // summed copy time of the fills that landed during decode
+    dcache_lazy_timed: u64 = 0,
     dcache_valid: bool = false,
     dcache_layers: u32 = 0,
     dcache_w13: cuda.CExpertBank = .{},
@@ -884,6 +905,15 @@ pub const Engine = struct {
         @memcpy(self.dcache_cmap_h, &cmap);
         self.dcache_es_h = pa.alloc(f32, 2 * n) catch unreachable;
         @memcpy(self.dcache_es_h, es_h);
+        if (tiger.getenv("SQUID_DECODE_CACHE_LAZY")) |lv| self.dcache_lazy = lv[0] == '1';
+        if (self.dcache_lazy) {
+            tiger.assert(n < 4096);
+            self.dcache_pend = pa.alloc(u32, n) catch unreachable;
+            tiger.assert_cuda(cuda.squid_cuda_event_create(&self.dcache_fill_fork, 0));
+            tiger.assert_cuda(cuda.squid_cuda_event_create(&self.dcache_fill_last, 0));
+            for (&self.dcache_fill_evs) |*e| tiger.assert_cuda(cuda.squid_cuda_event_create(e, 0));
+            tiger.print_stdout("[dcache] lazy upload: the per-request slot uploads run on aux_stream in chunks of {d} while decoding starts\n", .{lazy_chunk});
+        }
         self.dcache_sel0 = pa.alloc(u16, n) catch unreachable;
         @memcpy(self.dcache_sel0, self.dcache_sel);
         self.dcache_tail_on = self.dcache_tail_count(0);
@@ -1020,13 +1050,24 @@ pub const Engine = struct {
 
     fn ensure_decode_cache(self: *Engine) void {
         if (self.dcache_n == 0 or self.dcache_valid) return;
+        self.dcache_fill_join(); // (none in flight in practice: restores and prefills follow a join)
         const w = self.weights.?;
         const t0: u64 = tiger.clock_monotonic_ns();
+        const lazy: bool = self.dcache_lazy and self.dcache_lazy_armed;
+        const ne = constants.expert_count;
+        var np: usize = 0;
         for (self.dcache_sel, 0..) |id, c| {
             if (id == 0xffff) continue; // tail slot switched off
             if (c >= self.dcache_na) {
                 if (self.dcache_loaded[c - self.dcache_na] == id) continue;
                 self.dcache_loaded[c - self.dcache_na] = id;
+            }
+            if (lazy) {
+                const kk: usize = @as(usize, id >> 8) * ne + (id & 0xff);
+                self.dcache_pend[np] = @intCast(kk * 4096 + c);
+                np += 1;
+                self.dcache_cmap_h[kk] = -1; // the CPU computes it until its chunk has landed
+                continue;
             }
             const lw = &w.layers[id >> 8];
             const e: u64 = id & 0xff;
@@ -1037,6 +1078,19 @@ pub const Engine = struct {
                 tiger.assert_cuda(cuda.squid_cuda_memcpy_default_async(@ptrCast(self.dcache_slot_ptr(k, c)), @ptrCast(src + e * sz), @intCast(sz), self.stream));
             }
         }
+        if (lazy and np > 0) {
+            // after everything queued so far (the prefill that used bank A's buffers, the hole restores)
+            tiger.assert_cuda(cuda.squid_cuda_event_record(self.dcache_fill_fork, self.stream));
+            tiger.assert_cuda(cuda.squid_cuda_stream_wait_event(self.aux_stream, self.dcache_fill_fork));
+            self.dcache_npend = np;
+            self.dcache_pq = 0;
+            self.dcache_pc = 0;
+            self.dcache_fill_head = 0;
+            self.dcache_fill_tail = 0;
+            self.dcache_lazy_fills += 1;
+            self.dcache_fill_topup();
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.dcache_cmap.?), @ptrCast(self.dcache_cmap_h.ptr), self.dcache_cmap_h.len * @sizeOf(i32), self.stream));
+        }
         tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
         self.dcache_upload_ns += tiger.clock_monotonic_ns() - t0;
         self.dcache_uploads += 1;
@@ -1044,10 +1098,103 @@ pub const Engine = struct {
         self.dcache_valid = true;
     }
 
+    /// Lazy upload: queue the 4 copies of listed upload i on aux_stream (skipped if its slot was switched off).
+    fn dcache_fill_copy(self: *Engine, i: usize) void {
+        const ne = constants.expert_count;
+        const pc = self.dcache_pend[i];
+        const k: usize = pc / 4096;
+        const c: usize = pc % 4096;
+        const id = self.dcache_sel[c];
+        if (id == 0xffff or @as(usize, id >> 8) * ne + (id & 0xff) != k) return;
+        const lw = &self.weights.?.layers[id >> 8];
+        const e: u64 = id & 0xff;
+        const srcs = [4]*const anyopaque{ @ptrCast(lw.w13.data.?), @ptrCast(lw.w13.scales.?), @ptrCast(lw.w2.data.?), @ptrCast(lw.w2.scales.?) };
+        for (0..4) |a| {
+            const sz = self.dcache_esz[a];
+            const src: [*]const u8 = @ptrCast(srcs[a]);
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_default_async(@ptrCast(self.dcache_slot_ptr(a, c)), @ptrCast(src + e * sz), @intCast(sz), self.aux_stream));
+        }
+    }
+
+    /// Lazy upload: queue more chunks, at most lazy_inflight experts ahead of the switched-on ones. Called right
+    /// after a token's graph launch (GPU busy, host idle) and when the fill starts.
+    fn dcache_fill_topup(self: *Engine) void {
+        while (self.dcache_pq < self.dcache_npend and self.dcache_pq - self.dcache_pc < lazy_inflight and
+            self.dcache_fill_tail - self.dcache_fill_head < lazy_ring)
+        {
+            const end = @min(self.dcache_pq + lazy_chunk, self.dcache_npend);
+            while (self.dcache_pq < end) : (self.dcache_pq += 1) self.dcache_fill_copy(self.dcache_pq);
+            const r = self.dcache_fill_tail % lazy_ring;
+            tiger.assert_cuda(cuda.squid_cuda_event_record(self.dcache_fill_evs[r], self.aux_stream));
+            self.dcache_fill_end[r] = end;
+            self.dcache_fill_tail += 1;
+        }
+    }
+
+    /// Lazy upload: point the cmap at listed uploads [pc, end) (their copies are visible to later stream work).
+    fn dcache_fill_commit(self: *Engine, end: usize) void {
+        const ne = constants.expert_count;
+        while (self.dcache_pc < end) : (self.dcache_pc += 1) {
+            const pc = self.dcache_pend[self.dcache_pc];
+            const k: usize = pc / 4096;
+            const c: usize = pc % 4096;
+            const id = self.dcache_sel[c];
+            if (id == 0xffff or @as(usize, id >> 8) * ne + (id & 0xff) != k) continue; // slot switched off meanwhile
+            self.dcache_cmap_h[k] = self.dcache_enc(c);
+        }
+    }
+
+    fn dcache_fill_done(self: *Engine) void {
+        self.dcache_npend = 0;
+        self.dcache_pq = 0;
+        self.dcache_pc = 0;
+        self.dcache_fill_head = 0;
+        self.dcache_fill_tail = 0;
+    }
+
+    /// Token boundary (stream idle): switch on the chunks that have landed.
+    fn dcache_fill_poll(self: *Engine) void {
+        if (self.dcache_npend == 0) return;
+        var moved = false;
+        while (self.dcache_fill_head < self.dcache_fill_tail) {
+            const r = self.dcache_fill_head % lazy_ring;
+            const q = cuda.squid_cuda_event_query(self.dcache_fill_evs[r]);
+            if (q == 1) break;
+            tiger.assert_cuda(q);
+            self.dcache_fill_commit(self.dcache_fill_end[r]);
+            self.dcache_fill_head += 1;
+            moved = true;
+        }
+        if (moved) tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.dcache_cmap.?), @ptrCast(self.dcache_cmap_h.ptr), self.dcache_cmap_h.len * @sizeOf(i32), self.stream));
+        if (self.dcache_pc == self.dcache_npend) {
+            var ms: f32 = 0;
+            const last = self.dcache_fill_evs[(self.dcache_fill_head - 1) % lazy_ring];
+            if (cuda.squid_cuda_event_elapsed_ms(&ms, self.dcache_fill_fork, last) == 0) {
+                self.dcache_lazy_fill_ms += ms;
+                self.dcache_lazy_timed += 1;
+            }
+            self.dcache_fill_done();
+        } else self.dcache_lazy_tokens += 1;
+    }
+
+    /// Anything that writes the slots on the stream (tail guard, end-of-request restores, the next prefill) must
+    /// follow a fill in flight: queue the rest, make the stream wait for it (no host block), switch everything on.
+    fn dcache_fill_join(self: *Engine) void {
+        if (self.dcache_npend == 0) return;
+        while (self.dcache_pq < self.dcache_npend) : (self.dcache_pq += 1) self.dcache_fill_copy(self.dcache_pq);
+        tiger.assert_cuda(cuda.squid_cuda_event_record(self.dcache_fill_last, self.aux_stream));
+        tiger.assert_cuda(cuda.squid_cuda_stream_wait_event(self.stream, self.dcache_fill_last));
+        self.dcache_lazy_late += 1;
+        self.dcache_fill_commit(self.dcache_npend);
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.dcache_cmap.?), @ptrCast(self.dcache_cmap_h.ptr), self.dcache_cmap_h.len * @sizeOf(i32), self.stream));
+        self.dcache_fill_done();
+    }
+
     /// Between decode tokens (stream idle): fold the post kernel's routing counts into the session scores and swap up
     /// to M cached experts for hotter uncached ones (copies queued on the decode stream, before the next token).
     fn adapt_decode_cache(self: *Engine) void {
         if (self.dcache_adapt_n == 0 or !self.dcache_valid) return;
+        if (self.dcache_npend > 0) return; // lazy fill in flight: its experts look uncached; adapt after it lands
         const ne = constants.expert_count;
         const nn = constants.layer_count * ne;
         var hist: [constants.layer_count * constants.expert_count]u32 = undefined;
@@ -1427,6 +1574,7 @@ pub const Engine = struct {
     fn dcache_tail_guard(self: *Engine, hi: u32) void {
         const on = self.dcache_tail_count(hi);
         if (on >= self.dcache_tail_on) return;
+        self.dcache_fill_join();
         const ne = constants.expert_count;
         const pe: usize = @intCast(self.dcache_esz[0] + self.dcache_esz[1] + self.dcache_esz[2] + self.dcache_esz[3]);
         var t: u32 = on;
@@ -1778,6 +1926,10 @@ pub const Engine = struct {
         self.cpu_moe_layers = 0;
     }
 
+    const lazy_ring: usize = 8;
+    const lazy_chunk: usize = 32; // experts per chunk (4 copies each)
+    const lazy_inflight: usize = 128; // experts queued ahead of the landed ones (~520 pending operations)
+
     pub fn deinit(self: *Engine) void {
         if (self.dbank_uploads > 0) {
             tiger.print_stdout("[dbank] {d} uploads of layer {d}'s experts, avg {d:.1} ms\n", .{ self.dbank_uploads, self.dbank_layer, @as(f64, @floatFromInt(self.dbank_upload_ns)) / @as(f64, @floatFromInt(self.dbank_uploads)) / 1e6 });
@@ -1787,6 +1939,14 @@ pub const Engine = struct {
             if (self.dcache_adapt_steps > 0) tiger.print_stdout("[dcache] adaptive: {d} steps, {d} swaps ({d:.2} per step)\n", .{ self.dcache_adapt_steps, self.dcache_swaps, @as(f64, @floatFromInt(self.dcache_swaps)) / @as(f64, @floatFromInt(self.dcache_adapt_steps)) });
             if (self.dcache_tail_pos.len > 0) tiger.print_stdout("[dcache] tail slots: {d}, {d} usable at exit, switched off {d} times\n", .{ self.dcache_tail_pos.len, self.dcache_tail_on, self.dcache_tail_evicts });
             if (self.dcache_nh > 0) tiger.print_stdout("[dcache] hole slots: {d}, restored {d} times\n", .{ self.dcache_nh, self.dcache_hole_restores });
+            if (self.dcache_lazy) {
+                tiger.print_stdout("[dcache] lazy uploads: {d}, avg copy {d:.1} ms ({d} timed); {d} token boundaries with a fill in flight; {d} joined before landing\n", .{ self.dcache_lazy_fills, if (self.dcache_lazy_timed > 0) self.dcache_lazy_fill_ms / @as(f64, @floatFromInt(self.dcache_lazy_timed)) else 0.0, self.dcache_lazy_timed, self.dcache_lazy_tokens, self.dcache_lazy_late });
+                if (self.aux_stream) |s| tiger.assert_cuda(cuda.squid_cuda_stream_sync(s));
+                if (self.dcache_fill_fork) |e| tiger.assert_cuda(cuda.squid_cuda_event_destroy(e));
+                if (self.dcache_fill_last) |e| tiger.assert_cuda(cuda.squid_cuda_event_destroy(e));
+                for (self.dcache_fill_evs) |ev| if (ev) |e| tiger.assert_cuda(cuda.squid_cuda_event_destroy(e));
+                std.heap.page_allocator.free(self.dcache_pend);
+            }
             if (self.dcache_hist) |p| tiger.assert_cuda(cuda.squid_cuda_free(@ptrCast(p)));
             const pa = std.heap.page_allocator;
             pa.free(self.dcache_hist_last);
@@ -2294,7 +2454,9 @@ pub const Engine = struct {
         const use_adaptive: bool = use_mtp and self.use_graphs and num_drafts == constants.mtp_draft_count_max and self.spec_threshold > 0.0;
         if (!use_mtp) {
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_tokens), @ptrCast(&first_tok), @sizeOf(i32), self.stream));
+            self.dcache_lazy_armed = true;
             self.ensure_decode_bank();
+            self.dcache_lazy_armed = false;
             self.ensure_b1_graph();
         } else if (use_adaptive) {
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_anchor), @ptrCast(&first_tok), @sizeOf(i32), self.stream));
@@ -2324,7 +2486,9 @@ pub const Engine = struct {
                     cuda.squid_launch_inc_pos_and_copy_tok(self.d_pos, &self.d_tokens[0], &self.d_next_tokens[0], self.stream);
                 }
                 tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(self.h_accepted.?), @ptrCast(self.d_next_tokens), @sizeOf(i32), self.stream));
+                if (self.dcache_npend > 0) self.dcache_fill_topup();
                 tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+                if (self.dcache_npend > 0) self.dcache_fill_poll();
 
                 if (self.prefix_cache.enabled and shield_tokens == 0 and self.prefix_cache.session_len < self.context_tokens_max) {
                     self.prefix_cache.session_tokens[self.prefix_cache.session_len] = prev_fed_tok;
@@ -2348,6 +2512,7 @@ pub const Engine = struct {
                 }
                 if (tok == constants.eos_token_id) break;
             }
+            self.dcache_fill_join();
             self.score_flush();
             if (self.dcache_tail_check) self.dcache_tail_verify();
         } else if (use_adaptive) {

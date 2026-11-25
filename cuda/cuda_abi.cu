@@ -499,6 +499,13 @@ int32_t squid_cuda_event_record(void* ev, void* stream) {
     return (int32_t)cudaEventRecord(static_cast<cudaEvent_t>(ev), static_cast<cudaStream_t>(stream));
 }
 int32_t squid_cuda_event_sync(void* ev) { return (int32_t)cudaEventSynchronize(static_cast<cudaEvent_t>(ev)); }
+// 0 = complete, 1 = not yet (cudaErrorNotReady, cleared so no later check sees it), else the error
+int32_t squid_cuda_event_query(void* ev) {
+    cudaError_t e = cudaEventQuery(static_cast<cudaEvent_t>(ev));
+    if (e == cudaSuccess) return 0;
+    if (e == cudaErrorNotReady) { (void)cudaGetLastError(); return 1; }
+    return (int32_t)e;
+}
 int32_t squid_cuda_event_elapsed_ms(float* out_ms, void* ev0, void* ev1) {
     return (int32_t)cudaEventElapsedTime(out_ms, static_cast<cudaEvent_t>(ev0), static_cast<cudaEvent_t>(ev1));
 }
