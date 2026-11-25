@@ -1942,6 +1942,267 @@ moe_down_tc_persist_kernel(
     }
 }
 
+// ---- spec verify (B = n <= MOE_MAXM tokens) on the decode expert cache ----------------------------------------
+// gcode[8 t + k] = GPU code of token t's top-k slot k (cache slot / MOE_HOST_TAG | e / MOE_BANK2_TAG | c /
+// MOE_TAIL_TAG | t, as glist entries) or -1 (a CPU slot). Each distinct code is read ONCE per pass: its tokens are
+// the MMA's n columns (moe_up_tc_persist_kernel computes column 0 only). Per token the arithmetic is the B = 1
+// kernels' (the MMA columns are independent, the same cross-warp sums, the same slot order in the final sum).
+// act_h: [(8 t + k)][INTERMEDIATE]; out_down: [t][HIDDEN] (every row t < n written; no GPU slot -> 0).
+constexpr int MOE_MT_SLOTS = MOE_MAXM * TOP_K;  // 64
+
+__device__ __forceinline__ int moe_mt_unique(const int32_t* gcode, int n, int* uexp, unsigned long long* umask,
+                                             uint8_t* slot_u) {
+    const int lane = threadIdx.x & 31;
+    const int lo = (lane < 8 * n) ? ld_dep_i32(gcode + lane) : -1;
+    const int hi = (32 + lane < 8 * n) ? ld_dep_i32(gcode + 32 + lane) : -1;
+    uint64_t remaining = uint64_t(__ballot_sync(0xffffffffu, lo >= 0)) | (uint64_t(__ballot_sync(0xffffffffu, hi >= 0)) << 32);
+    int u = 0;
+    for (; remaining; ++u) {
+        const int s = __ffsll(static_cast<long long>(remaining)) - 1;
+        const int e = __shfl_sync(0xffffffffu, s < 32 ? lo : hi, s & 31);
+        const uint64_t mask = moe_slot_mask(e, lo, hi);
+        remaining &= ~mask;
+        if (lane == 0) { uexp[u] = e; umask[u] = mask; }
+        if (slot_u) {
+            if ((mask >> lane) & 1) slot_u[lane] = uint8_t(u);
+            if ((mask >> (32 + lane)) & 1) slot_u[32 + lane] = uint8_t(u);
+        }
+    }
+    return u;
+}
+
+__global__ void __launch_bounds__(MOE_UP_WARPS * 32)
+moe_up_tc_multi_kernel(
+    const __half* __restrict__ x_h, const int32_t* __restrict__ gcode, int n,
+    const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws, const float* __restrict__ wfactor,
+    __half* __restrict__ out_act_h,
+    const uint8_t* __restrict__ wh, const uint8_t* __restrict__ wsh, const float* __restrict__ wfh,
+    const uint8_t* __restrict__ wb, const uint8_t* __restrict__ wsb, const float* __restrict__ wfb) {
+    constexpr int FMT = 0;
+    constexpr int K = HIDDEN;
+    constexpr int R = 2 * INTERMEDIATE;
+    constexpr int CB = K >> 1, SB = K >> 4;
+    constexpr int TILES = R / MOE_TILE;
+    __shared__ float red[MOE_UP_WARPS][32][4];
+    __shared__ float tile_out[MOE_TILE][MOE_MAXM + 1];
+    __shared__ int uexp[MOE_MT_SLOTS];
+    __shared__ unsigned long long umask[MOE_MT_SLOTS];
+    __shared__ int nuniq;
+
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int g = lane >> 2;
+    const int t = lane & 3;
+
+    pdl_wait();
+    pdl_trigger();
+    if (warp == 0) {
+        const int u = moe_mt_unique(gcode, n, uexp, umask, nullptr);
+        if (lane == 0) nuniq = u;
+    }
+    __syncthreads();
+    const int U = nuniq;
+    const int total = TILES * U;
+
+    auto prep = [&](int it, MoeFrag<FMT>& f) {
+        const int tile = it % TILES;
+        const int u = it / TILES;
+        const int e = uexp[u];
+        const bool hst = (e & MOE_HOST_TAG) != 0, b2 = (e & MOE_BANK2_TAG) != 0;
+        const uint8_t* pw;
+        const uint8_t* ps;
+        if (e & MOE_TAIL_TAG) {
+            const size_t r = (size_t)tile * MOE_TILE + g;
+            pw = c_moe_tail[0][e & MOE_IDX_MASK] + r * CB;
+            ps = c_moe_tail[1][e & MOE_IDX_MASK] + r * SB;
+        } else {
+            const size_t row = (size_t)(e & MOE_IDX_MASK) * R + tile * MOE_TILE + g;
+            pw = (hst ? wh : b2 ? wb : w) + row * CB;
+            ps = (hst ? wsh : b2 ? wsb : ws) + row * SB;
+        }
+        moe_load_w<FMT, K>(f, pw, ps, 4 * warp + t);
+        const bool uses = g < n && ((umask[u] >> (8 * g)) & 0xffu) != 0;  // MMA column g = token g
+        moe_load_x<FMT>(f, uses ? x_h + (size_t)g * K : nullptr, 4 * warp + t);
+    };
+
+    int item = blockIdx.x;
+    MoeFrag<FMT> nxt;
+    if (item < total) prep(item, nxt);
+    #pragma unroll 1
+    while (item < total) {
+        const MoeFrag<FMT> cur = nxt;
+        const int u = item / TILES;
+        const int tile = item % TILES;
+        const int next = item + gridDim.x;
+        if (next < total) prep(next, nxt);
+        item = next;
+        const int e = uexp[u];
+        const unsigned long long m = umask[u];
+
+        float d[4] = {0.f, 0.f, 0.f, 0.f};
+        moe_mma_frag<FMT>(cur, d);
+        #pragma unroll
+        for (int v = 0; v < 4; ++v) red[warp][lane][v] = d[v];
+        __syncthreads();
+
+        if (threadIdx.x < 32) {
+            float sacc[4] = {0.f, 0.f, 0.f, 0.f};
+            #pragma unroll
+            for (int ww = 0; ww < MOE_UP_WARPS; ++ww) {
+                #pragma unroll
+                for (int v = 0; v < 4; ++v) sacc[v] += red[ww][lane][v];
+            }
+            const float es = ((e & MOE_HOST_TAG) ? wfh : (e & MOE_BANK2_TAG) ? wfb : wfactor)[(e & MOE_IDX_MASK) + ((e & MOE_TAIL_TAG) ? c_moe_tail_wf_off : 0)];
+            tile_out[g][2 * t]         = sacc[0] * es;
+            tile_out[g][2 * t + 1]     = sacc[1] * es;
+            tile_out[g + 8][2 * t]     = sacc[2] * es;
+            tile_out[g + 8][2 * t + 1] = sacc[3] * es;
+        }
+        __syncthreads();
+
+        if (threadIdx.x < (MOE_TILE / 2) * MOE_MAXM) {
+            const int p = threadIdx.x % (MOE_TILE / 2);
+            const int nn = threadIdx.x / (MOE_TILE / 2);
+            uint32_t kmask = uint32_t(m >> (8 * nn)) & 0xffu;
+            if (kmask) {
+                const float gate = tile_out[2 * p][nn];
+                const float up   = tile_out[2 * p + 1][nn];
+                const float g_cap = fast_tanh(gate * (1.0f / GATE_SOFTCAP)) * GATE_SOFTCAP;
+                const float u_cap = fast_tanh(up * (1.0f / UP_SOFTCAP)) * UP_SOFTCAP;
+                const __half ah = __float2half((g_cap * fast_sigmoid(gate)) * u_cap);
+                while (kmask) {
+                    const int k = __ffs(kmask) - 1;
+                    kmask &= kmask - 1;
+                    out_act_h[(size_t)(nn * TOP_K + k) * INTERMEDIATE + tile * (MOE_TILE / 2) + p] = ah;
+                }
+            }
+        }
+    }
+}
+
+__global__ void __launch_bounds__(MOE_DOWN_WARPS * 32)
+moe_down_tc_multi_kernel(
+    const __half* __restrict__ act_h, const int32_t* __restrict__ gcode, int n, const float* __restrict__ wts,
+    const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws, const float* __restrict__ wfactor,
+    float* __restrict__ out_down,
+    const uint8_t* __restrict__ wh, const uint8_t* __restrict__ wsh, const float* __restrict__ wfh,
+    const uint8_t* __restrict__ wb, const uint8_t* __restrict__ wsb, const float* __restrict__ wfb) {
+    constexpr int FMT = 0;
+    constexpr int K = INTERMEDIATE;
+    constexpr int R = HIDDEN;
+    constexpr int CB = K >> 1, SB = K >> 4;
+    constexpr int TILES = R / MOE_TILE;
+    __shared__ float part[MOE_DOWN_WARPS][32][4];
+    __shared__ float yslot[MOE_MT_SLOTS][MOE_TILE];
+    __shared__ int uexp[MOE_MT_SLOTS];
+    __shared__ unsigned long long umask[MOE_MT_SLOTS];
+    __shared__ int nuniq;
+
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int g = lane >> 2;
+    const int t = lane & 3;
+    if (warp == 0) {  // gcode was written by a kernel that completed before the preceding (up) one started
+        const int u = moe_mt_unique(gcode, n, uexp, umask, nullptr);
+        if (lane == 0) nuniq = u;
+    }
+    __syncthreads();
+
+    const int U = nuniq;
+    const int p = warp / MOE_DOWN_GROUPS;
+    const int c = 4 * (warp % MOE_DOWN_GROUPS) + t;
+
+    auto xrow = [&](int u) -> const __half* {
+        const uint32_t kmask = (g < n) ? (uint32_t(umask[u] >> (8 * g)) & 0xffu) : 0u;
+        return kmask ? (act_h + ((size_t)g * TOP_K + (__ffs(kmask) - 1)) * K) : nullptr;
+    };
+    auto load_w_tu = [&](int tl, int u, MoeFrag<FMT>& f) {
+        const int e = uexp[u];
+        const bool hst = (e & MOE_HOST_TAG) != 0, b2 = (e & MOE_BANK2_TAG) != 0;
+        const uint8_t* pw;
+        const uint8_t* ps;
+        if (e & MOE_TAIL_TAG) {
+            const size_t r = (size_t)tl * MOE_TILE + g;
+            pw = c_moe_tail[2][e & MOE_IDX_MASK] + r * CB;
+            ps = c_moe_tail[3][e & MOE_IDX_MASK] + r * SB;
+        } else {
+            const size_t row = (size_t)(e & MOE_IDX_MASK) * R + tl * MOE_TILE + g;
+            pw = (hst ? wh : b2 ? wb : w) + row * CB;
+            ps = (hst ? wsh : b2 ? wsb : ws) + row * SB;
+        }
+        moe_load_w<FMT, K>(f, pw, ps, c);
+    };
+    auto load_x_u = [&](int u, MoeFrag<FMT>& f) { moe_load_x<FMT>(f, xrow(u), c); };
+
+    int tile = blockIdx.x;
+    MoeFrag<FMT> nxt;
+    if (tile < TILES && p < U) load_w_tu(tile, p, nxt);
+    pdl_wait();
+    if (tile < TILES && p < U) load_x_u(p, nxt);
+
+    #pragma unroll 1
+    while (tile < TILES) {
+        const int next_tile = tile + gridDim.x;
+        #pragma unroll 1
+        for (int base = 0; base < U; base += MOE_DOWN_PAR) {
+            const MoeFrag<FMT> cur = nxt;
+            const int u = base + p;
+            if (u + MOE_DOWN_PAR < U) {
+                load_w_tu(tile, u + MOE_DOWN_PAR, nxt);
+                load_x_u(u + MOE_DOWN_PAR, nxt);
+            } else if (u < U && next_tile < TILES) {
+                load_w_tu(next_tile, p, nxt);
+                load_x_u(p, nxt);
+            }
+            float d[4] = {0.f, 0.f, 0.f, 0.f};
+            if (u < U) moe_mma_frag<FMT>(cur, d);
+            #pragma unroll
+            for (int v = 0; v < 4; ++v) part[warp][lane][v] = d[v];
+            __syncthreads();
+
+            if (threadIdx.x < MOE_DOWN_PAR * 32 && base + (threadIdx.x >> 5) < U) {
+                const int pp = threadIdx.x >> 5;
+                float sacc[4] = {0.f, 0.f, 0.f, 0.f};
+                #pragma unroll
+                for (int j = 0; j < MOE_DOWN_GROUPS; ++j) {
+                    #pragma unroll
+                    for (int v = 0; v < 4; ++v) sacc[v] += part[pp * MOE_DOWN_GROUPS + j][lane][v];
+                }
+                const int uu = base + pp;
+                const int ue = uexp[uu];
+                const unsigned long long m = umask[uu];
+                const float es = ((ue & MOE_HOST_TAG) ? wfh : (ue & MOE_BANK2_TAG) ? wfb : wfactor)[(ue & MOE_IDX_MASK) + ((ue & MOE_TAIL_TAG) ? c_moe_tail_wf_off : 0)];
+                #pragma unroll
+                for (int h = 0; h < 2; ++h) {  // MMA columns 2t + h = tokens
+                    const int nn = 2 * t + h;
+                    uint32_t km = uint32_t(m >> (8 * nn)) & 0xffu;
+                    while (km) {
+                        const int k = __ffs(km) - 1;
+                        km &= km - 1;
+                        yslot[nn * TOP_K + k][g]     = sacc[h] * es;
+                        yslot[nn * TOP_K + k][g + 8] = sacc[2 + h] * es;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+        if (next_tile >= TILES) pdl_trigger();
+
+        if (threadIdx.x < MOE_TILE * n) {
+            const int r = threadIdx.x & (MOE_TILE - 1);
+            const int nn = threadIdx.x / MOE_TILE;
+            float sum = 0.f;
+            #pragma unroll
+            for (int k = 0; k < TOP_K; ++k) {
+                if (ld_dep_i32(gcode + nn * TOP_K + k) < 0) continue;
+                sum = fmaf(ld_dep_f32(wts + nn * TOP_K + k), yslot[nn * TOP_K + k][r], sum);
+            }
+            out_down[(size_t)nn * HIDDEN + tile * MOE_TILE + r] = sum;
+        }
+        tile = next_tile;
+    }
+}
+
 static int moe_down_persist_grid(bool force = false) {
     static int full = [] {
         int dev = 0, sms = 0, per_sm = 0;
@@ -2158,6 +2419,22 @@ void launch_moe_slots_list_h(
         static_cast<const uint8_t*>(w2b.data), static_cast<const uint8_t*>(w2b.scales), static_cast<const float*>(w2b.expert_scale));
 }
 
+
+void launch_moe_slots_multi_h(
+    const ExpertBank& w13, const ExpertBank& w2, const ExpertBank& w13b, const ExpertBank& w2b, const ExpertBank& w13h,
+    const ExpertBank& w2h, const __half* x_h, const float* route_w, __half* act_h, float* out_down, const int32_t* gcode,
+    int n, cudaStream_t stream) {
+    launch_pdl(moe_up_tc_multi_kernel, dim3(moe_up_persist_grid(true)), MOE_UP_WARPS * 32, stream,
+        x_h, gcode, n, static_cast<const uint8_t*>(w13.data), static_cast<const uint8_t*>(w13.scales),
+        static_cast<const float*>(w13.expert_scale), act_h,
+        static_cast<const uint8_t*>(w13h.data), static_cast<const uint8_t*>(w13h.scales), static_cast<const float*>(w13h.expert_scale),
+        static_cast<const uint8_t*>(w13b.data), static_cast<const uint8_t*>(w13b.scales), static_cast<const float*>(w13b.expert_scale));
+    launch_pdl(moe_down_tc_multi_kernel, dim3(moe_down_persist_grid(true)), MOE_DOWN_WARPS * 32, stream,
+        static_cast<const __half*>(act_h), gcode, n, route_w, static_cast<const uint8_t*>(w2.data),
+        static_cast<const uint8_t*>(w2.scales), static_cast<const float*>(w2.expert_scale), out_down,
+        static_cast<const uint8_t*>(w2h.data), static_cast<const uint8_t*>(w2h.scales), static_cast<const float*>(w2h.expert_scale),
+        static_cast<const uint8_t*>(w2b.data), static_cast<const uint8_t*>(w2b.scales), static_cast<const float*>(w2b.expert_scale));
+}
 
 cudaError_t set_moe_tail_slots(const void* const* w13, const void* const* w13s, const void* const* w2,
                                const void* const* w2s, int n, int wf_off) {

@@ -359,6 +359,66 @@ AVX512_I16_TARGET static inline void rows2_dot_i16x2(
     *out1 = _mm512_reduce_add_ps(acc1);
 }
 
+// Spec verify (mode MULTI): rows2_dot_i16 for M inputs at once (the tokens of a verify pass that route to the same
+// expert). Per 64-weight group the codes are loaded, widened and mapped through the e2m1 table once and the E4M3 block
+// scales expanded once; each input adds its two vpdpwssd and one scale FMA, in rows2_dot_i16's per-lane order, so
+// every output is bit-identical to a rows2_dot_i16 call with that input. M is a compile-time constant per call site.
+#define MT_MAX CPU_MOE_MT_MAX
+AVX512_I16_TARGET __attribute__((always_inline)) static inline void rows2_dot_i16_m(
+    const uint8_t* c0, const uint8_t* s0, const uint8_t* c1, const uint8_t* s1, const XQ* const* xq, const int M,
+    int K, float* out0, float* out1) {
+    const __m512i tbl = _mm512_loadu_si512((const void*)k_e2m1_x2_s16);
+    const __m512i sidx_a = _mm512_set_epi32(3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0);
+    const __m512i sidx_b = _mm512_set_epi32(7, 7, 7, 7, 6, 6, 6, 6, 5, 5, 5, 5, 4, 4, 4, 4);
+    const __mmask64 m4 = 0x1111111111111111ull;
+    __m512 acc0[MT_MAX], acc1[MT_MAX];
+    for (int j = 0; j < M; ++j) acc0[j] = acc1[j] = _mm512_setzero_ps();
+    const int ng = K / 64;
+    for (int q = 0; q < ng; q += 2) {
+        const __m512i sb0 = _mm512_castsi128_si512(_mm_loadl_epi64((const __m128i*)(s0 + 4 * q)));
+        const __m512i sb1 = _mm512_castsi128_si512(_mm_loadl_epi64((const __m128i*)(s1 + 4 * q)));
+#define GROUPM(QQ, SIDX)                                                                                           \
+    {                                                                                                              \
+        const __m512i cw0 = _mm512_cvtepu8_epi16(_mm256_loadu_si256((const __m256i*)(c0 + 32 * (QQ))));            \
+        const __m512i cw1 = _mm512_cvtepu8_epi16(_mm256_loadu_si256((const __m256i*)(c1 + 32 * (QQ))));            \
+        const __m512i we0 = _mm512_permutexvar_epi16(cw0, tbl), wo0 = _mm512_permutexvar_epi16(_mm512_srli_epi16(cw0, 4), tbl); \
+        const __m512i we1 = _mm512_permutexvar_epi16(cw1, tbl), wo1 = _mm512_permutexvar_epi16(_mm512_srli_epi16(cw1, 4), tbl); \
+        const __m512 e0 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_maskz_permutexvar_epi8(m4, SIDX, sb0), 20)); \
+        const __m512 e1 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_maskz_permutexvar_epi8(m4, SIDX, sb1), 20)); \
+        for (int j = 0; j < M; ++j) {                                                                              \
+            const __m512i xe = _mm512_loadu_si512((const void*)(xq[j]->q16 + 64 * (QQ)));                          \
+            const __m512i xo = _mm512_loadu_si512((const void*)(xq[j]->q16 + 64 * (QQ) + 32));                     \
+            const __m512 sv = _mm512_loadu_ps(xq[j]->sv[QQ]);                                                      \
+            const __m512i d0 = _mm512_dpwssd_epi32(_mm512_dpwssd_epi32(_mm512_setzero_si512(), we0, xe), wo0, xo); \
+            const __m512i d1 = _mm512_dpwssd_epi32(_mm512_dpwssd_epi32(_mm512_setzero_si512(), we1, xe), wo1, xo); \
+            acc0[j] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d0), _mm512_mul_ps(e0, sv), acc0[j]);                     \
+            acc1[j] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d1), _mm512_mul_ps(e1, sv), acc1[j]);                     \
+        }                                                                                                          \
+    }
+        GROUPM(q, sidx_a)
+        GROUPM(q + 1, sidx_b)
+#undef GROUPM
+    }
+    for (int j = 0; j < M; ++j) {
+        out0[j] = _mm512_reduce_add_ps(acc0[j]);
+        out1[j] = _mm512_reduce_add_ps(acc1[j]);
+    }
+}
+
+AVX512_I16_TARGET static void dot_m(const uint8_t* c0, const uint8_t* s0, const uint8_t* c1, const uint8_t* s1,
+                                    const XQ* const* xq, int M, int K, float* out0, float* out1) {
+    switch (M) {
+        case 1: rows2_dot_i16_m(c0, s0, c1, s1, xq, 1, K, out0, out1); break;
+        case 2: rows2_dot_i16_m(c0, s0, c1, s1, xq, 2, K, out0, out1); break;
+        case 3: rows2_dot_i16_m(c0, s0, c1, s1, xq, 3, K, out0, out1); break;
+        case 4: rows2_dot_i16_m(c0, s0, c1, s1, xq, 4, K, out0, out1); break;
+        case 5: rows2_dot_i16_m(c0, s0, c1, s1, xq, 5, K, out0, out1); break;
+        case 6: rows2_dot_i16_m(c0, s0, c1, s1, xq, 6, K, out0, out1); break;
+        case 7: rows2_dot_i16_m(c0, s0, c1, s1, xq, 7, K, out0, out1); break;
+        default: rows2_dot_i16_m(c0, s0, c1, s1, xq, 8, K, out0, out1); break;
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // Visit compute (shared by the threaded runtime, the self-test and the standalone bench)
 // ---------------------------------------------------------------------------------------------------------------
@@ -560,6 +620,92 @@ static void phase_down_kouter(const LayerBanks* lb, const VisitState* vs, int r0
     for (int r = r0; r < r1; ++r) y[r] = acc[r - r0];
 }
 
+// Spec verify (mode MULTI, i16 kernel): the CPU slots of n tokens in one visit. Every distinct expert among them is
+// read once: phase 1 items are (distinct expert, 16-pair block), each computing that block for all its users (token,
+// slot); phase 2 items are output row pairs, each streaming every distinct expert's rows once and summing per token
+// in slot order. Per token the arithmetic is the single-token path's (phase_up + phase_down[_kouter]) exactly.
+typedef struct {
+    int n;                         // tokens in the request
+    int nd;                        // distinct experts
+    int de[MT_MAX * TOPK];         // expert of distinct entry d
+    int nu[MT_MAX * TOPK];         // its users (at most one per token: a token's top-8 are distinct experts)
+    uint8_t ut[MT_MAX * TOPK][MT_MAX], uk[MT_MAX * TOPK][MT_MAX];  // user u of d: token, top-k slot
+    int nsl[MT_MAX], sl[MT_MAX][TOPK];                             // per token: CPU slots, ascending
+    int ids[MT_MAX][TOPK];
+    float wts[MT_MAX][TOPK];
+    XQ xq[MT_MAX];                 // MoE input per token
+    XQ aq[MT_MAX][TOPK];           // activations per (token, slot)
+    float* y[MT_MAX];              // result per token
+} MultiState;
+static MultiState g_mt;
+static int g_mt_on = 0;            // the current request is a MULTI one on the shared-expert path
+static int g_mt_seq = 0;           // SQUID_CPU_MOE_MULTI=seq: MULTI requests run token by token (no expert sharing)
+
+AVX512_I16_TARGET static void phase_up_multi(const LayerBanks* lb, int b0, int b1) {
+    const size_t row_cb = HIDDEN / 2, row_sb = HIDDEN / 16;
+    const int nb = INTER / 16;
+    for (int blk = b0; blk < b1; ++blk) {
+        const int d = blk / nb, i0 = (blk % nb) * 16;
+        const int e = g_mt.de[d], M = g_mt.nu[d];
+        const float es = lb->es13[e];
+        const XQ* xs[MT_MAX];
+        for (int u = 0; u < M; ++u) xs[u] = &g_mt.xq[g_mt.ut[d][u]];
+        float a16[MT_MAX][16];
+        for (int t = 0; t < 16; ++t) {
+            const size_t r0 = 2 * (size_t)(i0 + t);
+            const uint8_t* c0 = lb->xp[e][0] + r0 * row_cb;
+            const uint8_t* s0 = lb->xp[e][1] + r0 * row_sb;
+            float g[MT_MAX], v[MT_MAX];
+            dot_m(c0, s0, c0 + row_cb, s0 + row_sb, xs, M, HIDDEN, g, v);
+            for (int u = 0; u < M; ++u) {
+                const float gg = g[u] * es, uu = v[u] * es;
+                const float a = (softcap(gg, GATE_CAP) * sigmoidf_(gg)) * softcap(uu, UP_CAP);
+                a16[u][t] = f16_to_f32(f32_to_f16(a));
+            }
+        }
+        for (int u = 0; u < M; ++u) {
+            XQ* aq = &g_mt.aq[g_mt.ut[d][u]][g_mt.uk[d][u]];
+            if (g_quant_scalar) quant_block(aq, i0 / 16, a16[u]);
+            else quant_block_v(aq, i0 / 16, _mm512_loadu_ps(a16[u]));
+        }
+    }
+}
+
+AVX512_I16_TARGET static void phase_down_multi(const LayerBanks* lb, int r0, int r1) {
+    const size_t row_cb = INTER / 2, row_sb = INTER / 16;
+    enum { RC = 32 };
+    float dbuf[MT_MAX][TOPK][RC];
+    for (int rc = r0; rc < r1; rc += RC) {
+        const int re = rc + RC < r1 ? rc + RC : r1;  // r0, r1 even: every step is a full row pair
+        for (int d = 0; d < g_mt.nd; ++d) {
+            const int e = g_mt.de[d], M = g_mt.nu[d];
+            const XQ* xs[MT_MAX];
+            for (int u = 0; u < M; ++u) xs[u] = &g_mt.aq[g_mt.ut[d][u]][g_mt.uk[d][u]];
+            for (int r = rc; r < re; r += 2) {
+                const uint8_t* c0 = lb->xp[e][2] + (size_t)r * row_cb;
+                const uint8_t* s0 = lb->xp[e][3] + (size_t)r * row_sb;
+                float d0[MT_MAX], d1[MT_MAX];
+                dot_m(c0, s0, c0 + row_cb, s0 + row_sb, xs, M, INTER, d0, d1);
+                for (int u = 0; u < M; ++u) {
+                    dbuf[g_mt.ut[d][u]][g_mt.uk[d][u]][r - rc] = d0[u];
+                    dbuf[g_mt.ut[d][u]][g_mt.uk[d][u]][r + 1 - rc] = d1[u];
+                }
+            }
+        }
+        for (int t = 0; t < g_mt.n; ++t) {
+            if (!g_mt.nsl[t]) continue;
+            for (int r = rc; r < re; ++r) {
+                float acc = 0.f;
+                for (int j = 0; j < g_mt.nsl[t]; ++j) {
+                    const int k = g_mt.sl[t][j];
+                    acc = fmaf(g_mt.wts[t][k], dbuf[t][k][r - rc] * lb->es2[g_mt.ids[t][k]], acc);
+                }
+                g_mt.y[t][r] = acc;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // Threaded runtime
 // ---------------------------------------------------------------------------------------------------------------
@@ -596,6 +742,7 @@ static struct {
     _Atomic int stop;
     int phase;                     // 1 = up, 2 = down; published by the job_gen release
     uint64_t requests;
+    uint64_t multi_requests;           // of them mode MULTI (spec verify)
     uint64_t busy_ns;
     uint64_t max_ns;
     uint64_t prep_ns, up_ns, down_ns;  // per-phase totals (input prep, phase 1, phase 2)
@@ -688,6 +835,11 @@ static int g_steal_up = 0, g_steal_down = 0;  // chunk sizes (blocks, row pairs)
 // Item space of a phase: 16-pair blocks of the visit's slot list (minus the GPU's K-split part of its first slot),
 // or output row pairs.
 static void phase_items(int phase, int* first, int* total) {
+    if (g_mt_on) {
+        *first = 0;
+        *total = phase == 1 ? g_mt.nd * (INTER / 16) : HIDDEN / 2;
+        return;
+    }
     if (phase == 1) {
         *first = g.vs.ks / 16;
         *total = g.vs.nsl * (INTER / 16) - *first;
@@ -697,10 +849,16 @@ static void phase_items(int phase, int* first, int* total) {
     }
 }
 
+static float* g_yout;  // the current visit's result: sh->y, or a MULTI token's mt_y[t] (token-by-token path)
 static void do_items(const LayerBanks* lb, int phase, int i0, int i1) {
+    if (g_mt_on) {
+        if (phase == 1) phase_up_multi(lb, i0, i1);
+        else phase_down_multi(lb, 2 * i0, 2 * i1);
+        return;
+    }
     if (phase == 1) phase_up(lb, &g.vs, i0, i1);
-    else if (g_down_kouter) phase_down_kouter(lb, &g.vs, 2 * i0, 2 * i1, (float*)g.sh->y);
-    else phase_down(lb, &g.vs, 2 * i0, 2 * i1, (float*)g.sh->y);
+    else if (g_down_kouter) phase_down_kouter(lb, &g.vs, 2 * i0, 2 * i1, g_yout);
+    else phase_down(lb, &g.vs, 2 * i0, 2 * i1, g_yout);
 }
 
 // Coordinator, before publishing a stealing phase: each thread's cursor at the start of its static range.
@@ -806,10 +964,13 @@ static void run_phase(int phase) {
     }
 }
 
+static void handle_multi(uint32_t seq);
 static void handle_request(uint32_t seq) {
+    if (g.sh->mode == CPU_MOE_MODE_MULTI) { handle_multi(seq); return; }
     const uint64_t t0 = now_ns();
     CpuMoeShared* sh = g.sh;
     VisitState* vs = &g.vs;
+    g_yout = (float*)sh->y;
     vs->layer = (int)sh->layer;
     vs->mode = (int)sh->mode;  // only CPU_MOE_MODE_FULL is issued
     const uint32_t mask = sh->slot_mask & 0xffu;
@@ -842,6 +1003,90 @@ static void handle_request(uint32_t seq) {
     *(volatile uint32_t*)&sh->resp_seq = seq;
     const uint64_t dt = now_ns() - t0;
     g.requests++;
+    g.busy_ns += dt;
+    if (dt > g.max_ns) g.max_ns = dt;
+}
+
+// Mode MULTI (spec verify): n tokens, token t's CPU slots in mt_mask[t]; result t in mt_y[t] (tokens with a mask).
+static void handle_multi(uint32_t seq) {
+    const uint64_t t0 = now_ns();
+    CpuMoeShared* sh = g.sh;
+    int layer = (int)sh->layer;
+    if (layer < 0 || layer >= MAX_LAYERS || !g.layers[layer].w13_codes) layer = 0;  // never fault
+    const int n = sh->n_tok < 1 ? 1 : sh->n_tok > MT_MAX ? MT_MAX : (int)sh->n_tok;
+    const int fast = g_kernel == KERNEL_I16 && !g_mt_seq;
+    double slots = 0;
+    g_mt.n = n;
+    g_mt.nd = 0;
+    for (int t = 0; t < n; ++t) {
+        const uint32_t mask = sh->mt_mask[t] & 0xffu;
+        g_mt.nsl[t] = 0;
+        g_mt.y[t] = sh->mt_y[t];
+        for (int k = 0; k < TOPK; ++k) {
+            const int e = sh->mt_ids[t][k];
+            g_mt.ids[t][k] = (e < 0 || e > 127) ? 0 : e;
+            g_mt.wts[t][k] = sh->mt_wts[t][k];
+        }
+        if (!mask) continue;
+        slots += __builtin_popcount(mask);
+        if (!fast) {  // token by token through the single-token phases (other kernels, or SQUID_CPU_MOE_MULTI=seq)
+            VisitState* vs = &g.vs;
+            vs->layer = layer;
+            vs->mode = CPU_MOE_MODE_FULL;
+            vs->k0 = 0;
+            vs->ks = 0;
+            set_slots(vs, mask);
+            for (int k = 0; k < TOPK; ++k) { vs->ids[k] = g_mt.ids[t][k]; vs->wts[k] = g_mt.wts[t][k]; }
+            if (KERNEL_IS_INT(g_kernel) && !g_quant_scalar) {
+                quant_x_f16((const uint16_t*)sh->mt_x[t], HIDDEN, &vs->xq);
+            } else {
+                float x[HIDDEN];
+                for (int i = 0; i < HIDDEN; ++i) x[i] = f16_to_f32(sh->mt_x[t][i]);
+                prep_input(vs, x);
+            }
+            g_yout = sh->mt_y[t];
+            run_phase(1);
+            run_phase(2);
+            continue;
+        }
+        if (g_quant_scalar) {
+            float x[HIDDEN];
+            for (int i = 0; i < HIDDEN; ++i) x[i] = f16_to_f32(sh->mt_x[t][i]);
+            quant_x(x, HIDDEN, &g_mt.xq[t]);
+        } else {
+            quant_x_f16((const uint16_t*)sh->mt_x[t], HIDDEN, &g_mt.xq[t]);
+        }
+        for (int k = 0; k < TOPK; ++k) {
+            if (!((mask >> k) & 1u)) continue;
+            g_mt.sl[t][g_mt.nsl[t]++] = k;
+            const int e = g_mt.ids[t][k];
+            int d = 0;
+            while (d < g_mt.nd && g_mt.de[d] != e) ++d;
+            if (d == g_mt.nd) { g_mt.de[d] = e; g_mt.nu[d] = 0; g_mt.nd++; }
+            g_mt.ut[d][g_mt.nu[d]] = (uint8_t)t;
+            g_mt.uk[d][g_mt.nu[d]] = (uint8_t)k;
+            g_mt.nu[d]++;
+        }
+    }
+    g.vs.layer = layer;  // do_phase_share reads the layer from vs
+    const uint64_t t1 = now_ns();
+    if (fast && g_mt.nd > 0) {
+        g_mt_on = 1;
+        run_phase(1);
+        const uint64_t t2 = now_ns();
+        run_phase(2);
+        g_mt_on = 0;
+        g.up_ns += t2 - t1;
+        g.down_ns += now_ns() - t2;
+    }
+    g_yout = (float*)sh->y;
+    g.prep_ns += t1 - t0;
+    g.slots_done += slots;
+    atomic_thread_fence(memory_order_release);
+    *(volatile uint32_t*)&sh->resp_seq = seq;
+    const uint64_t dt = now_ns() - t0;
+    g.requests++;
+    g.multi_requests++;
     g.busy_ns += dt;
     if (dt > g.max_ns) g.max_ns = dt;
 }
@@ -908,6 +1153,8 @@ int cpu_moe_available(void) {
         if (kv && !strcmp(kv, "fp32") && ok) g_kernel = KERNEL_FP32;
         if (kv && !strcmp(kv, "i16") && g_have_vnni) g_kernel = KERNEL_I16;
         if (kv && !strcmp(kv, "i16x2") && g_have_vnni) g_kernel = KERNEL_I16X2;
+        const char* mv = getenv("SQUID_CPU_MOE_MULTI");
+        g_mt_seq = mv && !strcmp(mv, "seq");
         const char* dv = getenv("SQUID_CPU_MOE_DOWN");
         g_down_kouter = dv && !strcmp(dv, "kouter");
         const char* pv = getenv("SQUID_CPU_MOE_PF");
@@ -1345,6 +1592,70 @@ int main(int argc, char** argv) {
             uint32_t ck = 0;
             for (int i = 0; i < HIDDEN; ++i) { uint32_t u; memcpy(&u, &sh->y[i], 4); ck = ck * 31u + u; }
             printf("threaded visit vs scalar reference: max abs diff %.3g (max |y| %.3g), rel L2 %.3g | y checksum %08x\n", maxd, maxv, sqrt(se / sr), ck);
+        }
+    }
+    // MULTI (spec verify) vs single-token requests: bit-identical per token, and the time of one n-token request vs n
+    // single ones. MT_SHARE = how many of a token's CPU slots reuse an expert of token 0 (default 1 of 4).
+    {
+        const int share = getenv("MT_SHARE") ? atoi(getenv("MT_SHARE")) : 1;
+        const int ncpu = getenv("MT_SLOTS") ? atoi(getenv("MT_SLOTS")) : 4;
+        uint32_t seq = 50000;
+        static float ysingle[MT_MAX][HIDDEN];
+        for (int n = 2; n <= MT_MAX; n *= 2) {
+            double tm = 1e9, ts = 1e9;
+            long bad = 0;
+            for (int rep = 0; rep < 40; ++rep) {
+                const int layer = rep % NL;
+                int ids[MT_MAX][TOPK];
+                uint32_t mask[MT_MAX];
+                for (int tt = 0; tt < n; ++tt) {
+                    // token tt: distinct ids; slots 0..ncpu-1 are CPU slots; the first `share` reuse token 0's
+                    for (int k = 0; k < TOPK; ++k) ids[tt][k] = (rep * 53 + tt * 29 + k * 13) % 128;
+                    if (tt > 0) for (int k = 0; k < share && k < ncpu; ++k) ids[tt][k] = ids[0][k];
+                    for (int k = 0; k < TOPK; ++k) for (int j = 0; j < k; ++j) if (ids[tt][j] == ids[tt][k]) ids[tt][k] = (ids[tt][k] + 64 + k) % 128;
+                    mask[tt] = (1u << ncpu) - 1u;
+                    if (tt == 1 && rep % 3 == 0) mask[tt] = 0;  // a token with every slot cached
+                    for (int k = 0; k < TOPK; ++k) { sh->mt_ids[tt][k] = ids[tt][k]; sh->mt_wts[tt][k] = 0.1f + 0.01f * k; }
+                    for (int i = 0; i < HIDDEN; ++i) sh->mt_x[tt][i] = f32_to_f16((float)((i * 7 + tt * 5 + rep) % 23) / 11.0f - 1.0f);
+                    sh->mt_mask[tt] = mask[tt];
+                }
+                sh->layer = layer;
+                sh->n_tok = n;
+                sh->mode = CPU_MOE_MODE_MULTI;
+                double t0 = secs();
+                atomic_thread_fence(memory_order_release);
+                *(volatile uint32_t*)&sh->req_seq = ++seq;
+                while (*(volatile uint32_t*)&sh->resp_seq != seq) _mm_pause();
+                const double dm = secs() - t0;
+                // the same tokens as single requests: once warm on the same layer (results to compare), then timed
+                // cold on another layer with the ids shifted (the warm pass would find the multi pass's experts in L3)
+                double dsg = 0;
+                for (int pass = 0; pass < 2; ++pass) {
+                    sh->layer = pass ? (layer + 2) % NL : layer;
+                    t0 = secs();
+                    for (int tt = 0; tt < n; ++tt) {
+                        if (!mask[tt]) continue;
+                        for (int k = 0; k < TOPK; ++k) { sh->ids[k] = pass ? (ids[tt][k] + 41) % 128 : ids[tt][k]; sh->wts[k] = sh->mt_wts[tt][k]; }
+                        memcpy(sh->x, sh->mt_x[tt], sizeof sh->x);
+                        sh->slot_mask = mask[tt];
+                        sh->slot_begin = 0;
+                        sh->mode = CPU_MOE_MODE_FULL;
+                        atomic_thread_fence(memory_order_release);
+                        *(volatile uint32_t*)&sh->req_seq = ++seq;
+                        while (*(volatile uint32_t*)&sh->resp_seq != seq) _mm_pause();
+                        if (!pass) memcpy(ysingle[tt], sh->y, sizeof sh->y);
+                    }
+                    dsg = secs() - t0;
+                }
+                if (rep == 4) tm = ts = 0;
+                if (rep >= 4) { tm += dm / 36; ts += dsg / 36; }  // means (best-of would pick the masked-token reps)
+                for (int tt = 0; tt < n; ++tt)
+                    if (mask[tt]) bad += memcmp(ysingle[tt], sh->mt_y[tt], sizeof ysingle[tt]) != 0;
+            }
+            sh->slot_mask = 0;
+            printf("MULTI n=%d (%d CPU slots/token, %d shared with token 0): %s vs single requests (%ld token results differ) | "
+                   "mean %.0f us vs %.0f us for %d single requests (%.2fx)\n",
+                   n, ncpu, share, bad ? "DIFFERENT" : "bit-identical", bad, tm * 1e6, ts * 1e6, n, tm / ts);
         }
     }
     // PATTERN: emulate whole decode tokens. One char per visit: H = CPU visit, V = GPU-only (VRAM) visit; every visit

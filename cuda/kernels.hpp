@@ -110,6 +110,14 @@ void launch_moe_slots_list_h(
     const ExpertBank& w2h, const __half* x_h, const float* route_w, __half* act_h, float* out_down, const int32_t* glist,
     cudaStream_t stream);
 
+// Spec verify (B = n <= 8) on the decode expert cache: up + down for every token's GPU slots in one pass, each
+// distinct expert read once for all its tokens. gcode[8 t + k] = token t's top-k slot k as a glist entry, or -1 (a
+// CPU slot); x_h / route_w / out_down: [n] rows; act_h: [8 n][INTERMEDIATE]. out_down rows get the GPU slots' sum.
+void launch_moe_slots_multi_h(
+    const ExpertBank& w13, const ExpertBank& w2, const ExpertBank& w13b, const ExpertBank& w2b, const ExpertBank& w13h,
+    const ExpertBank& w2h, const __half* x_h, const float* route_w, __half* act_h, float* out_down, const int32_t* gcode,
+    int n, cudaStream_t stream);
+
 // Decode expert cache pointer-table slots (MOE_TAIL_TAG | t: KV-tail and hole slots): w13[t] / w13s[t] / w2[t] /
 // w2s[t] = device address of slot t's w13 data, w13 block scales, w2 data, w2 block scales; the slot's expert scale
 // is the cache bank's expert_scale[wf_off + t]. Synchronous.

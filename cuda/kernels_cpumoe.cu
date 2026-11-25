@@ -174,6 +174,104 @@ __global__ void __launch_bounds__(kThreads) cpu_moe_post_cache_kernel(
     }
 }
 
+// Spec verify (B = n > 1, n <= CPU_MOE_MT_MAX) on the decode expert cache: cpu_moe_post_cache_kernel's split for each
+// of the n tokens (warp t: token t; its GPU slot list at glist + 32 t, same layout), then ONE request (mode MULTI) with
+// every token's CPU slot mask. glist[32 * CPU_MOE_MT_MAX] = 1 if a request was posted. glist[320 + 8 t + k] = the
+// GPU code of token t's top-k slot k (a glist entry) or -1 (CPU): the input of launch_moe_slots_multi_h.
+constexpr int kGcodeOff = 320;
+__global__ void __launch_bounds__(kThreads) cpu_moe_post_cache_multi_kernel(
+    const __half* __restrict__ x_h, const int32_t* __restrict__ ids, const float* __restrict__ wts,
+    CpuMoeShared* sh, uint32_t* seq_ctr, int layer, const int32_t* __restrict__ cmap_l, int32_t* glist,
+    uint32_t* hist_l, int pcie_h, int n) {
+    constexpr int kHostTag = 1 << 16;  // = MOE_HOST_TAG (kernels_gemv.cu)
+    __shared__ uint32_t s_mask[CPU_MOE_MT_MAX];
+    const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
+    if (w < n) {
+        int32_t* gl = glist + 32 * w;
+        const int e = (lane < 8) ? ids[8 * w + lane] : 0;
+        int c = (lane < 8) ? cmap_l[e] : -1;
+        uint32_t gmask = __ballot_sync(0xffffffffu, c >= 0) & 0xffu;
+        if (__popc(gmask) <= pcie_h && gmask != 0xffu) {
+            const int s0 = __ffs(~gmask & 0xffu) - 1;
+            if (lane == s0) c = kHostTag | e;
+            gmask |= 1u << s0;
+        }
+        if (c >= 0) {
+            const int j = __popc(gmask & ((1u << lane) - 1u));
+            gl[1 + j] = c;
+            gl[9 + j] = lane;
+        }
+        if (lane < 8) glist[kGcodeOff + 8 * w + lane] = c;  // -1: a CPU slot
+        if (lane < 8 && hist_l) atomicAdd(hist_l + e, 1u);
+        if (lane == 0) {
+            const uint32_t cpu_mask = ~gmask & 0xffu;
+            gl[0] = __popc(gmask);
+            gl[17] = __popc(cpu_mask);
+            s_mask[w] = cpu_mask;
+        }
+    } else if (w < CPU_MOE_MT_MAX && lane == 0) {
+        s_mask[w] = 0;
+    }
+    __syncthreads();
+    uint32_t any = 0;
+    for (int t = 0; t < n; ++t) any |= s_mask[t];
+    if (tid == 0) glist[32 * CPU_MOE_MT_MAX] = any ? 1 : 0;
+    if (!any) return;
+    for (int i = tid; i < n * (kHidden / 8); i += kThreads) {
+        const int t = i / (kHidden / 8), j = i % (kHidden / 8);
+        if (s_mask[t]) reinterpret_cast<uint4*>(sh->mt_x[t])[j] = reinterpret_cast<const uint4*>(x_h + (size_t)t * kHidden)[j];
+    }
+    if (tid < 8 * n) {
+        sh->mt_ids[tid >> 3][tid & 7] = ids[tid];
+        sh->mt_wts[tid >> 3][tid & 7] = wts[tid];
+    }
+    if (tid < n) sh->mt_mask[tid] = s_mask[tid];
+    __shared__ uint32_t s_seq;
+    if (tid == 0) {
+        sh->layer = static_cast<uint32_t>(layer);
+        sh->mode = CPU_MOE_MODE_MULTI;
+        sh->n_tok = static_cast<uint32_t>(n);
+        const uint32_t s = *seq_ctr + 1;
+        *seq_ctr = s;
+        s_seq = s;
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (tid == 0) {
+        __threadfence_system();
+        st_release_sys_u32(&sh->req_seq, s_seq);
+    }
+}
+
+// After cpu_moe_post_cache_multi_kernel and the GPU slots of every token: wait for the CPU (if posted), then out[t] +=
+// mt_y[t] for each token t that had CPU slots.
+__global__ void __launch_bounds__(kThreads) cpu_moe_wait_add_multi_kernel(
+    CpuMoeShared* sh, const uint32_t* seq_ctr, float* __restrict__ out, int32_t* err, const int32_t* glist, int n) {
+    if (glist[32 * CPU_MOE_MT_MAX] == 0) return;
+    if (threadIdx.x == 0) {
+        const uint32_t s = *seq_ctr;
+        const uint64_t t0 = global_timer_ns();
+        while (ld_acquire_sys_u32(&sh->resp_seq) != s) {
+            if (global_timer_ns() - t0 > kTimeoutNs) {
+                atomicExch(err, 1);
+                break;
+            }
+        }
+    }
+    __syncthreads();
+    for (int t = 0; t < n; ++t) {
+        if (glist[32 * t + 17] == 0) continue;
+        const float4* ys = reinterpret_cast<const float4*>(sh->mt_y[t]);
+        float4* od = reinterpret_cast<float4*>(out + (size_t)t * kHidden);
+        for (int i = threadIdx.x; i < kHidden / 4; i += kThreads) {
+            const float4 c = __ldcv(ys + i);
+            float4 g = od[i];
+            g.x += c.x; g.y += c.y; g.z += c.z; g.w += c.w;
+            od[i] = g;
+        }
+    }
+}
+
 __global__ void __launch_bounds__(kThreads) cpu_moe_wait_add_kernel(
     CpuMoeShared* sh, const uint32_t* seq_ctr, float* __restrict__ out, int32_t* err, const int32_t* posted) {
     if (posted && *posted == 0) return;  // decode expert cache: every slot was cached, no CPU request
@@ -311,4 +409,18 @@ extern "C" void squid_launch_cpu_moe_wait_add_if(void* shared_dev, const uint32_
                                                  const int32_t* posted, void* stream) {
     cpu_moe_wait_add_kernel<<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
         static_cast<CpuMoeShared*>(shared_dev), seq_ctr, out, err, posted);
+}
+
+extern "C" void squid_launch_cpu_moe_post_cache_multi(
+    const void* x_h, const int32_t* ids, const float* wts, void* shared_dev, uint32_t* seq_ctr, int32_t layer,
+    const int32_t* cmap_l, int32_t* glist, uint32_t* hist_l, int32_t pcie_h, int32_t n, void* stream) {
+    cpu_moe_post_cache_multi_kernel<<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const __half*>(x_h), ids, wts, static_cast<CpuMoeShared*>(shared_dev), seq_ctr, layer, cmap_l,
+        glist, hist_l, pcie_h, n);
+}
+
+extern "C" void squid_launch_cpu_moe_wait_add_multi(void* shared_dev, const uint32_t* seq_ctr, float* out, int32_t* err,
+                                                    const int32_t* glist, int32_t n, void* stream) {
+    cpu_moe_wait_add_multi_kernel<<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<CpuMoeShared*>(shared_dev), seq_ctr, out, err, glist, n);
 }

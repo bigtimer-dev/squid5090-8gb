@@ -11,7 +11,10 @@ enum {
     CPU_MOE_MODE_FULL = 0,      // x -> y (both banks CPU-served)
     CPU_MOE_MODE_UP_ONLY = 1,   // x -> act (w13 on host, w2 in VRAM)
     CPU_MOE_MODE_DOWN_ONLY = 2, // act -> y (w13 in VRAM, w2 on host)
+    CPU_MOE_MODE_MULTI = 3,     // spec verify: n_tok tokens in the mt_* fields, each with its own slot mask (x -> y)
 };
+
+#define CPU_MOE_MT_MAX 8
 
 // Lives in mapped pinned host memory. Request and response fields sit on separate pages so GPU writes of the
 // request never share a cache line with the CPU's response writes.
@@ -33,6 +36,14 @@ typedef struct CpuMoeShared {
     uint16_t act[8][1152] __attribute__((aligned(4096)));  // fp16 activations, natural layout
     float y[2304] __attribute__((aligned(64)));
     uint32_t resp_seq __attribute__((aligned(64)));        // written last
+    // ---- spec verify, mode MULTI (GPU -> CPU): token t's MoE input, top-8 and CPU slot mask (0: nothing for t) ----
+    uint32_t n_tok __attribute__((aligned(4096)));
+    uint32_t mt_mask[CPU_MOE_MT_MAX];
+    int32_t mt_ids[CPU_MOE_MT_MAX][8];
+    float mt_wts[CPU_MOE_MT_MAX][8];
+    uint16_t mt_x[CPU_MOE_MT_MAX][2304] __attribute__((aligned(64)));
+    // ---- CPU -> GPU: token t's result (written for tokens with a non-zero mask) ----
+    float mt_y[CPU_MOE_MT_MAX][2304] __attribute__((aligned(4096)));
 } CpuMoeShared;
 
 int cpu_moe_available(void);

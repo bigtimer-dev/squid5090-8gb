@@ -5,6 +5,7 @@
 ## What this fork changes
 
 - **Generation is ~4× faster when the CPU computes the experts that live in RAM** (opt-in, see [Fast generation](#fast-generation-cpu--gpu-experts)): 54–55 tok/s instead of 12.5 on a short prompt at 64K context. While one sequence generates, the CPU computes the routed experts held in host RAM straight from RAM and the GPU computes the rest. Up to ~690 of the most-used host experts are also copied into VRAM that sits idle during generation: the prefill buffers, the unused end of the KV cache, and the slots of the 300 least-used VRAM-layer experts, which the CPU computes instead.
+- **Speculative drafting works with CPU + GPU experts** (`--mtp 7`, see [Drafting](#drafting-on-the-cpu--gpu-path)): ~67 tok/s on a short prompt instead of 54–55, and 74 instead of 48 tok/s over replayed OpenCode requests. The built-in DSpark drafter proposes 7 tokens and one target pass checks 1, 3 or 7 of them, depending on the drafter's confidence. In that pass the CPU computes the RAM experts of all the tokens in one request, and the GPU reads each cached expert once for all of them. Prompts take ~10% longer with the drafter on.
 - **Image input.** Chat requests can carry images in user and tool messages: OpenAI-style `image_url` parts with base64 `data:` URLs, in PNG, JPEG or WebP. Inkling-2-Mini's vision encoder runs on the GPU inside the prefill buffers. Its 609 MiB of weights stay in pinned host RAM and stream over PCIe one layer at a time, so it takes no VRAM and the context stays at 64K. See [Images](#images).
 - **Experts that don't fit in VRAM are read from host RAM.** Upstream keeps every weight in VRAM (15.6 GiB at 8K context). Here, the expert banks beyond the VRAM budget go into one mapped, pinned host buffer that the GPU reads zero-copy over PCIe. VRAM goes to the looped core layers first, because layers 6–17 run three times per token. If everything fits, nothing moves.
 - **`--uncensor PATH` applies the [AtomicChat uncensored LoRA](https://huggingface.co/AtomicChat/Inkling-2-Mini-Uncensored-GGUF) exactly.** That rank-1 LoRA is a projection removal, `y -= b·(b·y)`, on the attention output and on every expert's down projection, plus an edit to the embedding table. A new kernel applies the projection before the short conv. Upstream's `--ablation` hook runs after the conv, so it can't reproduce the LoRA. [`tools/uncensor-lora/`](tools/uncensor-lora/) checks the equivalence on the real weights and bakes the embedding edit into a reflinked copy of the checkpoint.
@@ -37,7 +38,7 @@ export SQUID_CPU_MOE=1 SQUID_CPU_MOE_GPU_SLOTS=1 SQUID_CPU_MOE_DOWN=kouter SQUID
        SQUID_DECODE_CACHE_PCIE=2 SQUID_DECODE_CACHE_ADAPT=16,16,0.9,4,reset SQUID_DECODE_CACHE_TAIL=256 \
        SQUID_DECODE_CACHE_DEMOTE=300 SQUID_DECODE_CACHE_LAZY=1
 ./zig-out/bin/squid5090 serve /opt/models/inkling-2-mini \
-  --mode nvfp4 --embed-host --mtp 0 --ctx 65536 --kv fp8 --host 127.0.0.1 --port 8080
+  --mode nvfp4 --embed-host --mtp 7 --ctx 65536 --kv fp8 --host 127.0.0.1 --port 8080
 ```
 
 How one generated token runs at 64K context with fp8 KV on the 8 GB card:
@@ -55,9 +56,34 @@ How one generated token runs at 64K context with fp8 KV on the 8 GB card:
   - Every prompt overwrites the prefill buffers and the demoted experts' slots, so that part of the cache is refilled for each request (~200 ms of copies with `SQUID_DECODE_CACHE_DEMOTE=300`). With `SQUID_DECODE_CACHE_LAZY=1` the refill runs in the background while the reply starts: chunks of 32 experts go over on a second stream, and each chunk's experts move from the CPU to the GPU at the next token boundary once it has landed. Nothing waits for it, so the second token comes 0.8 ms after the first instead of ~170 ms later; a 64-token reply runs at 52.3 tok/s after its first token instead of 47.0, and a 256-token one at 53.2 instead of 52.2. Copying the demoted experts back runs after the answer has gone out; it delays the next prompt by up to ~65 ms only when requests come back to back. The KV-tail part is put back after the answer, so it adds no wait.
 - **`SQUID_CPU_MOE_KEEPALIVE=20` keeps the AMD fabric clock up.** While generating, one CPU thread reads a private 64 MB buffer at up to 20 GB/s. Without that traffic, the fabric clock (FCLK) drops from 1960 to 1400 MHz during the GPU-only stretches of each token, and the CPU then reads RAM up to 30% slower.
 
+### Drafting on the CPU + GPU path
+
+With `--mtp 7`, the DSpark drafter drafts 7 tokens after each target pass, and the next target pass checks drafts as a batch of 2, 4 or 8 tokens. Upstream's adaptive switch picks the width from the number of leading drafts whose confidence is at least `--spec-threshold` (0.80). In the batched pass:
+- **The CPU gets one request for all the tokens.** It computes each token's RAM experts, reading an expert that several tokens share once.
+- **The GPU runs the cached experts of all the tokens in one up and one down launch** and reads each distinct expert once: each token is one column of the tensor-core tile, with the same per-token sums as the one-token kernels.
+- **Sampling stays on the GPU,** so the output follows the target's distribution. Greedy text matches `--mtp 0` until the first near-tie, where the batched arithmetic can pick the other token. On three of four test prompts that happened after 202, 81 and 39 tokens; the fourth matched to the end.
+
+A batched pass reads the union of its tokens' experts. Two tokens cost ~1.5 one-token passes, four ~2 and eight ~2.9. On chat and code text, acceptance falls quickly with draft depth, so the switch mostly checks one draft: on a code prompt it ran 81 passes of width 2, 25 of width 4 and 10 of width 8. Always checking all 7 drafts (`SQUID_SPEC_ADAPT=0`) is slower than not drafting on such text (44 vs 54 tok/s), but it is the fastest option on text that copies its context.
+
+Measured with the settings above, between `--mtp 0` runs before and after (median of 6 runs, 3 for 12.6K; temperature 0 unless noted):
+
+| | `--mtp 0` | `--mtp 7` |
+|---|---:|---:|
+| Generation, code prompt | 54.4 / 55.1 tok/s | **67.6 tok/s** |
+| Same, temperature 1.0 | 52.9 / 52.7 tok/s | **70.6 tok/s** |
+| Generation, chat prompt | 55.7 / 55.7 tok/s | **67.4 tok/s** |
+| Generation, editing a file (copies its context) | 52.2 / 52.2 tok/s | **102.4 tok/s** |
+| Generation after a 12.6K-token prompt (repeats its context) | 46.6 / 46.7 tok/s | **95.2 tok/s** |
+| Reading that 12.6K-token prompt | **25.1 s** | 27.6 s |
+| 42 replayed OpenCode requests: generation | 47.8 / 47.8 tok/s | **74.2 tok/s** |
+| Same: prompt reading, total | **165.3 s** | 183.1 s |
+| Same: whole replay | 308 / 311 s | **278 s** |
+
+Prompts take ~10% longer because the drafter also runs over every prompt token to fill its own KV cache. Tool calls, the needle tests at 32K and 62K, the KV-tail and hole checks, and image input pass with `--mtp 7`.
+
 Requirements and costs:
 - **CPU:** needs AVX-512 (F/BW/DQ/VBMI, plus VNNI for the int16 kernel). Without it the log prints `[cpu-moe] needs AVX-512 ...` and the engine stays GPU-only.
-- **Scope:** only one-sequence generation uses this path; batched prefill and multi-sequence decode don't.
+- **Scope:** only one-sequence generation uses this path, including the batched passes that check drafts; batched prefill and multi-sequence decode don't.
 - **CPU load:** 8 cores work while a sequence generates and sleep when the server is idle.
 
 **Numerical change:** greedy output is not bit-identical to the GPU-only path, because the CPU kernels round differently from the GPU's. It was compared with the GPU-only path on the uncensored model, teacher-forced:
@@ -109,7 +135,7 @@ With CPU + GPU experts the short-prompt speed is ~2 tok/s lower at first than af
 With GPU experts, generation is limited by PCIe: at 64K context, 42 of the 96 expert-bank visits per token are read from host RAM. Each bank that fits in VRAM adds about 0.5 tok/s, so a smaller context helps: `--ctx 32768` reaches 14.0 tok/s, and `--kv q4` reaches 13.6 tok/s at 64K (q4 quality not evaluated). With CPU + GPU experts, the limits are the CPU's RAM bandwidth and the many small GPU kernels per layer. On this Ryzen 9 8945HS, RAM reads top out at 62.7 GB/s at FCLK 1960 MHz, and the path reaches ~54. Tool calls (plain and streamed) and the prefix cache work in both modes: the second turn of a 12.6K-token conversation starts in 0.8 s.
 
 What didn't help on this machine:
-- MTP drafting: 13.6 tok/s with it versus 14.6 without, at 8K context, because verifying drafts pulls in more experts over PCIe.
+- MTP drafting with GPU experts: 13.6 tok/s with it versus 14.6 without, at 8K context, because verifying drafts pulls in more experts over PCIe. With CPU + GPU experts drafting helps (see [Drafting](#drafting-on-the-cpu--gpu-path)).
 - Write-combined host memory: no change.
 - A 1024-token prefill chunk: generation gains ~1 tok/s, but prompts are read at only ~410 tok/s.
 - Transparent huge pages for the host experts (`SQUID_HOST_THP=1`): no change.
@@ -143,8 +169,11 @@ Only `--mode nvfp4` has been tested with the offload.
 | `SQUID_DECODE_CACHE_ADAPT` | off | `N,M,decay,W[,reset]`: every N tokens swap up to M experts by score W·prior + decayed session uses; `reset` starts each request from the prior |
 | `SQUID_DECODE_CACHE_N`, `SQUID_DECODE_CACHE_N2` | all that fit, `0` | Cap on cached experts; extra slots in a dedicated VRAM bank |
 | `SQUID_DECODE_CACHE_TAIL` | `0` | Up to this many more cached experts in the unused ends of the global-layer KV arrays (224 fit with `--ctx 65536 --kv fp8`). A slot is switched off 64 positions before the sequence reaches it |
-| `SQUID_DECODE_CACHE_DEMOTE` | `0` | The CPU computes this many of the least-used VRAM-layer experts (by the prior) from pinned RAM copies, and their VRAM slots cache that many more host experts while generating. Needs `--mtp 0` |
+| `SQUID_DECODE_CACHE_DEMOTE` | `0` | The CPU computes this many of the least-used VRAM-layer experts (by the prior) from pinned RAM copies, and their VRAM slots cache that many more host experts while generating |
 | `SQUID_DECODE_CACHE_LAZY` | `0` | `1` = refill each request's cache slots in the background (chunks of 32 experts on a second stream) instead of before the second token; experts not landed yet run on the CPU |
+| `SQUID_SPEC_ADAPT` | `1` | With CPU + GPU experts and `--mtp 7`: `0` = always check all 7 drafts instead of the adaptive 2 / 4 / 8 switch |
+| `SQUID_SPEC_MULTI` | `1` | `0` = one CPU request per token in a batched pass instead of one for all the tokens |
+| `SQUID_SPEC_MTK` | `1` | `0` = run the GPU's cached experts one token at a time in a batched pass |
 | `SQUID_LOCAL_KV` | `bf16` | `fp8` = K/V of the 40 sliding-window visits as fp8 E4M3 with a per-(token, head) scale: generation +1.9% at 12.6K and +1.5% at 32K. **Lossy**: teacher-forced NLL vs the GPU-only path −0.0048 ± 0.0043 and +0.0067 ± 0.0026 nats (default −0.0039 and +0.0018), top token 995/1024 and 251/256, so it is off by default |
 | `SQUID_VISION` | `1` | `0` = no image input (requests with images get an error) |
 | `SQUID_IMAGE_MAX_TOKENS` | `1600` | Prompt tokens per image; larger images are downscaled |
