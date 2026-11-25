@@ -6,6 +6,7 @@
 
 - **Generation is ~4× faster when the CPU computes the experts that live in RAM** (opt-in, see [Fast generation](#fast-generation-cpu--gpu-experts)): 54–55 tok/s instead of 12.5 on a short prompt at 64K context. While one sequence generates, the CPU computes the routed experts held in host RAM straight from RAM and the GPU computes the rest. Up to ~690 of the most-used host experts are also copied into VRAM that sits idle during generation: the prefill buffers, the unused end of the KV cache, and the slots of the 300 least-used VRAM-layer experts, which the CPU computes instead.
 - **Speculative drafting works with CPU + GPU experts** (`--mtp 7`, see [Drafting](#drafting-on-the-cpu--gpu-path)): ~67 tok/s on a short prompt instead of 54–55, and 74 instead of 48 tok/s over replayed OpenCode requests. The built-in DSpark drafter proposes 7 tokens and one target pass checks 1, 3 or 7 of them, depending on the drafter's confidence. In that pass the CPU computes the RAM experts of all the tokens in one request, and the GPU reads each cached expert once for all of them. Prompts take ~10% longer with the drafter on.
+- **Prompts of up to ~80 tokens are read 1.7–2.9× faster with CPU + GPU experts** (see [Reading prompts](#reading-prompts-on-the-cpu--gpu-path)): the last ≤ 160 tokens of a prompt go through the generation path instead of a batched chunk that streams the host experts over PCIe. A 41-token prompt takes 0.50 s instead of 1.22 s. Prefill chunks also use 128-token tiles at every size when experts live in host RAM, which reads them fewer times: a 500-token prompt takes 2.2 s instead of 3.3, and 2.0 s instead of 2.9 with GPU experts. Replayed OpenCode requests spend 18% less time reading prompts.
 - **Image input.** Chat requests can carry images in user and tool messages: OpenAI-style `image_url` parts with base64 `data:` URLs, in PNG, JPEG or WebP. Inkling-2-Mini's vision encoder runs on the GPU inside the prefill buffers. Its 609 MiB of weights stay in pinned host RAM and stream over PCIe one layer at a time, so it takes no VRAM and the context stays at 64K. See [Images](#images).
 - **Experts that don't fit in VRAM are read from host RAM.** Upstream keeps every weight in VRAM (15.6 GiB at 8K context). Here, the expert banks beyond the VRAM budget go into one mapped, pinned host buffer that the GPU reads zero-copy over PCIe. VRAM goes to the looped core layers first, because layers 6–17 run three times per token. If everything fits, nothing moves.
 - **`--uncensor PATH` applies the [AtomicChat uncensored LoRA](https://huggingface.co/AtomicChat/Inkling-2-Mini-Uncensored-GGUF) exactly.** That rank-1 LoRA is a projection removal, `y -= b·(b·y)`, on the attention output and on every expert's down projection, plus an edit to the embedding table. A new kernel applies the projection before the short conv. Upstream's `--ablation` hook runs after the conv, so it can't reproduce the LoRA. [`tools/uncensor-lora/`](tools/uncensor-lora/) checks the equivalence on the real weights and bakes the embedding edit into a reflinked copy of the checkpoint.
@@ -74,16 +75,43 @@ Measured with the settings above, between `--mtp 0` runs before and after (media
 | Generation, chat prompt | 55.7 / 55.7 tok/s | **67.4 tok/s** |
 | Generation, editing a file (copies its context) | 52.2 / 52.2 tok/s | **102.4 tok/s** |
 | Generation after a 12.6K-token prompt (repeats its context) | 46.6 / 46.7 tok/s | **95.2 tok/s** |
-| Reading that 12.6K-token prompt | **25.1 s** | 27.6 s |
+| Reading that 12.6K-token prompt (before [the prompt changes](#reading-prompts-on-the-cpu--gpu-path)) | **25.1 s** | 27.6 s |
 | 42 replayed OpenCode requests: generation | 47.8 / 47.8 tok/s | **74.2 tok/s** |
-| Same: prompt reading, total | **165.3 s** | 183.1 s |
+| Same: prompt reading, total (before the prompt changes) | **165.3 s** | 183.1 s |
 | Same: whole replay | 308 / 311 s | **278 s** |
 
 Prompts take ~10% longer because the drafter also runs over every prompt token to fill its own KV cache. Tool calls, the needle tests at 32K and 62K, the KV-tail and hole checks, and image input pass with `--mtp 7`.
 
+### Reading prompts on the CPU + GPU path
+
+Upstream reads a prompt in batched chunks and ends with passes of up to 8 tokens. With experts in host RAM, both read those experts over PCIe: a chunk reads every host expert its tokens route to, which costs ~1.1 s even for 32 tokens, and an 8-token pass reads its tokens' experts in ~250 ms. Two changes:
+- **The last ≤ 160 tokens of a prompt run on the generation path,** 8 per pass, like the passes that check drafts: the CPU computes the RAM experts and the GPU computes the cached ones, in ~75 ms per pass. The decode cache is set up first, so its background refill runs while the prompt is read, and the first tokens of the reply come faster too. Longer prompts are still chunked, down to their last ≤ 8 tokens. 160 is about the break-even point on this machine (`SQUID_PREFILL_CPU_MAX`; `0` restores upstream).
+- **Prefill chunks use 128-token tiles at every size** when any expert bank is in host RAM. Upstream uses 32-token tiles for chunks of up to 512 tokens. Each tile reads its experts' weights, so with small tiles a 500-token chunk read the host experts several times and took longer than an 800-token chunk. The output is bit-identical (`SQUID_PREFILL_TM32_MAX`). This also applies with GPU experts. When every bank fits in VRAM, upstream's tiles are kept.
+
+Measured with the settings above and `--mtp 7`, against the previous build before and after (median of 3 runs, 32-token replies):
+
+| Prompt | Before | Now | Generation of the reply, before → now |
+|---|---:|---:|---:|
+| 41 tokens | 1.22 s | **0.50 s** | 62.9 → 69.9 tok/s |
+| 81 tokens | 1.43 s | **0.83 s** | 63.8 → 73.1 tok/s |
+| 130 tokens | 1.74 s | **1.28 s** | 63.7 → 76.4 tok/s |
+| 201 tokens | 1.94 s | **1.67 s** | 63.3 → 67.3 tok/s |
+| 300 tokens | 2.48 s | **1.81 s** | 69.8 → 73.5 tok/s |
+| 500 tokens | 3.33 s | **2.17 s** | 63.9 → 68.4 tok/s |
+| 800 tokens | 2.79 s | **2.54 s** | 53.6 → 56.4 tok/s |
+| 12.6K tokens | 27.6 s | **26.9 s** | |
+| 32K tokens | 67.2 s | **66.9 s** | |
+| 42 replayed OpenCode requests: prompt reading, total | 183.2 / 183.1 s | **150.9 s** | 76.1 / 74.3 → **79.8 tok/s** |
+
+With GPU experts (`--mtp 0`) the tiles alone take a 130-token prompt from 1.48 to 1.36 s, 300 tokens from 2.14 to 1.68 s and 500 tokens from 2.91 to 2.03 s.
+
+Over a 256-token reply to a 25-token code prompt the gain in generation is gone: 66.4 tok/s against 67.4 and 67.3. The prompt is computed differently, so the reply's text changes, and with it the share of accepted drafts (59.1% instead of 61.5%).
+
+**Numerical change:** the prompt tokens that take the generation path get its arithmetic, including the CPU kernels' rounding. In 8 greedy test runs the text matched the previous build for the first 9 to 222 tokens, then diverged. Teacher-forced on five texts, the mean NLL difference from the previous build is +0.0001 ± 0.0010 nats, pooled. Against the GPU-only path it is −0.0007 ± 0.0028 nats on 1024 tokens of upstream's README (top token 997/1024), and between −0.0033 and +0.0062 nats on four 256-token answers (top token 251–255/256). Of the 40 top-token disagreements, 37 were near-ties (top-2 margin ≤ 0.3); the other three had margins of 0.37, 0.44 and 0.97. The previous build had 34 disagreements on the same texts, all ≤ 0.3. With the tile change alone the output is bit-identical. Tool calls, the needle tests at 32K and 62K, the KV-tail and hole checks, and image input pass. Images in a short prompt are injected on the generation path.
+
 Requirements and costs:
 - **CPU:** needs AVX-512 (F/BW/DQ/VBMI, plus VNNI for the int16 kernel). Without it the log prints `[cpu-moe] needs AVX-512 ...` and the engine stays GPU-only.
-- **Scope:** only one-sequence generation uses this path, including the batched passes that check drafts; batched prefill and multi-sequence decode don't.
+- **Scope:** one-sequence generation uses this path, including the batched passes that check drafts, and so do the last ≤ 160 tokens of a prompt. Larger prefill chunks and multi-sequence decode don't.
 - **CPU load:** 8 cores work while a sequence generates and sleep when the server is idle.
 
 **Numerical change:** greedy output is not bit-identical to the GPU-only path, because the CPU kernels round differently from the GPU's. It was compared with the GPU-only path on the uncensored model, teacher-forced:
@@ -174,6 +202,8 @@ Only `--mode nvfp4` has been tested with the offload.
 | `SQUID_SPEC_ADAPT` | `1` | With CPU + GPU experts and `--mtp 7`: `0` = always check all 7 drafts instead of the adaptive 2 / 4 / 8 switch |
 | `SQUID_SPEC_MULTI` | `1` | `0` = one CPU request per token in a batched pass instead of one for all the tokens |
 | `SQUID_SPEC_MTK` | `1` | `0` = run the GPU's cached experts one token at a time in a batched pass |
+| `SQUID_PREFILL_CPU_MAX` | `160` | With CPU + GPU experts: a prompt remainder of at most this many tokens runs on the generation path, 8 tokens per pass, instead of a batched chunk; `0` = upstream's passes |
+| `SQUID_PREFILL_TM32_MAX` | `0` with host banks, else `512` | Prefill chunks of at most this many tokens use 32-token tiles in the expert GEMMs, larger ones 128 (bit-identical; at most 512) |
 | `SQUID_LOCAL_KV` | `bf16` | `fp8` = K/V of the 40 sliding-window visits as fp8 E4M3 with a per-(token, head) scale: generation +1.9% at 12.6K and +1.5% at 32K. **Lossy**: teacher-forced NLL vs the GPU-only path −0.0048 ± 0.0043 and +0.0067 ± 0.0026 nats (default −0.0039 and +0.0018), top token 995/1024 and 251/256, so it is off by default |
 | `SQUID_VISION` | `1` | `0` = no image input (requests with images get an error) |
 | `SQUID_IMAGE_MAX_TOKENS` | `1600` | Prompt tokens per image; larger images are downscaled |

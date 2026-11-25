@@ -344,6 +344,12 @@ pub const Engine = struct {
     // 2 / 4 / 8 by the run of drafts with confidence >= spec_threshold (the VRAM path's adaptive graph); 0: fixed k.
     spec_cpu_adapt: bool = true,
     spec_mtk: bool = true, // SQUID_SPEC_MTK: the GPU slots of a MULTI verify visit as one n-token pass (0: per token)
+    // SQUID_PREFILL_CPU_MAX (CPU + GPU experts with the decode cache): the passes of <= 8 tokens that end a prompt run on
+    // the decode path (prefill_tail_cpu), and a remainder of at most this many tokens skips the batched chunk for them:
+    // ~75 ms per 8 tokens there vs ~1.1 s + ~3.4 ms per token for a chunk, which streams every host expert once (even
+    // at ~170 on the RTX 4060 Laptop). 32 keeps upstream's chunk split; 0 = off (upstream: the passes read the GPU
+    // banks, streaming their host experts over PCIe).
+    prefill_cpu_max: u32 = 160,
     use_prompt_lookup: bool = true,
     prefill_b8_graph_exec: [2]?*anyopaque = .{ null, null },
 
@@ -614,6 +620,7 @@ pub const Engine = struct {
         self.spec_multi = if (tiger.getenv("SQUID_SPEC_MULTI")) |v| v[0] != '0' else true;
         self.spec_mtk = if (tiger.getenv("SQUID_SPEC_MTK")) |v| v[0] != '0' else true;
         self.spec_cpu_adapt = if (tiger.getenv("SQUID_SPEC_ADAPT")) |v| v[0] != '0' else true;
+        if (tiger.getenv("SQUID_PREFILL_CPU_MAX")) |v| self.prefill_cpu_max = std.fmt.parseInt(u32, std.mem.span(v), 10) catch self.prefill_cpu_max;
         self.oproj_post_fused = if (tiger.getenv("SQUID_OPROJ_POST_FUSED")) |v| v[0] != '0' else true;
         self.exp_groups = self.arena.alloc_raw(expert_groups_bytes);
         self.moe_act_h = self.arena.alloc_raw(b_max * constants.top_k_experts * constants.intermediate_dim * 2);
@@ -2977,16 +2984,20 @@ pub const Engine = struct {
 
     fn prefill_final_range(self: *Engine, prompt: []const i32, start_i: u32, prompt_len: u32, use_mtp: bool) u32 {
         tiger.assert(start_i < prompt_len);
-        self.dcache_holes_restore(); // its B <= 8 passes (graph or not) read the VRAM banks whole
+        const cpu_tail: bool = self.prefill_cpu_max > 0 and self.cpu_moe_layers != 0 and (self.dbank_layer >= 0 or self.dcache_n > 0);
+        // its B <= 8 passes (graph or not) read the VRAM banks whole; the chunks restore the holes themselves
+        if (!cpu_tail) self.dcache_holes_restore();
         var i: u32 = start_i;
+        const tail_max: u32 = if (cpu_tail) @max(self.prefill_cpu_max, 32) else 32;
         // Fast batched Tensor Core + multi-token MoE prefill leaving 1..31 tokens for final lm_head chunk
-        while (prompt_len - i > 32) {
+        while (prompt_len - i > tail_max) {
             const avail: u32 = prompt_len - i - 1;
             const chunk: u32 = @min(self.prefill_cap, avail & ~@as(u32, 7));
             if (chunk < 32) break;
             self.prefill_chunk_batched(prompt, i, chunk, use_mtp);
             i += chunk;
         }
+        if (cpu_tail) return self.prefill_tail_cpu(prompt, i, prompt_len, use_mtp);
         if (self.use_graphs and prompt_len - i > constants.mtp_block_size_max and !self.images_overlap(i, prompt_len - i)) {
             const pgraph = self.prefill_b8_graph_exec[if (use_mtp) 1 else 0].?;
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
@@ -3011,6 +3022,42 @@ pub const Engine = struct {
             self.img_inject_pos = if (self.images_overlap(i, batch)) i else -1;
             self.record_target_forward(@intCast(batch), use_mtp, is_last);
             self.img_inject_pos = -1;
+            self.current_position += @intCast(batch);
+            i += batch;
+            last_batch = batch;
+        }
+        return last_batch;
+    }
+
+    /// Fork: the passes of <= 8 tokens that end a prompt, on the CPU + GPU decode path. Upstream runs them on the GPU
+    /// banks, so each pass streams its routed host experts over PCIe (~250 ms for 8 tokens). Here the decode cache is
+    /// set up first (lazy: experts whose copies haven't landed run on the CPU) and each pass is a verify-style pass:
+    /// the CPU computes the host experts from RAM, the GPU the cached ones and the VRAM layers. Returns the size of
+    /// the last pass, like prefill_final_range.
+    fn prefill_tail_cpu(self: *Engine, prompt: []const i32, start_i: u32, prompt_len: u32, use_mtp: bool) u32 {
+        self.dcache_lazy_armed = true;
+        self.ensure_decode_bank();
+        self.dcache_lazy_armed = false;
+        var i: u32 = start_i;
+        var last_batch: u32 = 1;
+        while (i < prompt_len) {
+            const batch: u32 = @intCast(tiger.min_u64(constants.mtp_block_size_max, prompt_len - i));
+            const is_last: bool = (i + batch == prompt_len);
+            if (self.dcache_tail_on > 0) { // a pass writes KV positions [cp, cp + batch)
+                const cp: u32 = @intCast(self.current_position);
+                if (@as(u64, cp) + batch + self.dcache_tail_margin > self.dcache_tail_pos[self.dcache_tail_on - 1]) self.dcache_tail_guard(cp + batch);
+            }
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_tokens), @ptrCast(prompt[i..].ptr), batch * @sizeOf(i32), self.stream));
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
+            self.img_inject_pos = if (self.images_overlap(i, batch)) i else -1;
+            cuda.cpu_moe_kick();
+            self.dbank_use = true;
+            self.record_target_forward(@intCast(batch), use_mtp, is_last);
+            self.dbank_use = false;
+            self.img_inject_pos = -1;
+            if (self.dcache_npend > 0) self.dcache_fill_topup();
+            tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+            if (self.dcache_npend > 0) self.dcache_fill_poll();
             self.current_position += @intCast(batch);
             i += batch;
             last_batch = batch;

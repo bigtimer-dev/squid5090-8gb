@@ -9,6 +9,7 @@
 #include "weights.hpp"
 
 #include <cublas_v2.h>
+#include <cstdlib>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -1448,12 +1449,34 @@ void launch_prefill_controller_one(
     p_ctrl_finish_kernel<<<B, 256, 0, stream>>>(x, scratch_msg, scratch_f, scratch_g, post_norm, out, out_h);
 }
 
+// Token-tile rows of the prefill expert GEMMs (and of the tile list the sort builds for them): 32 for chunks of
+// up to SQUID_PREFILL_TM32_MAX tokens, else 128. Every tile reads its expert's weights once, so smaller tiles
+// re-read more of them. Over PCIe, for host-resident banks, that cost 9-32% of the prefill time of 130-500-token
+// prompts on the RTX 4060 Laptop, and 128 was never slower; so with any bank on the host the default is 0 (always
+// 128), else upstream's 512. Bit-identical either way.
+static int g_prefill_tm32_max = -1;
+
+static int prefill_tm32_max_or(int fallback) {
+    const char* v = getenv("SQUID_PREFILL_TM32_MAX");
+    const int n = v ? atoi(v) : fallback;
+    return n < 512 ? n : 512; // the grids cover 256 tiles: B <= 512 with 32 rows, B <= 2048 with 128
+}
+
+void prefill_tiles_set_host_banks(int banks_host) {
+    g_prefill_tm32_max = prefill_tm32_max_or(banks_host > 0 ? 0 : 512);
+}
+
+static int prefill_tile_rows(int B) {
+    if (g_prefill_tm32_max < 0) g_prefill_tm32_max = prefill_tm32_max_or(512);
+    return (B <= g_prefill_tm32_max) ? 32 : 128;
+}
+
 void launch_prefill_route_and_sort(
     const float* router_logits, const float* router_bias,
     int32_t* route_ids, float* route_w,
     int32_t* expert_offsets, int32_t* sorted_tok, int32_t* sorted_slot, float* sorted_w,
     int B, cudaStream_t stream) {
-    int TR = (B <= 512) ? 32 : 128;
+    int TR = prefill_tile_rows(B);
     p_route_topk_only_kernel<<<B, 32, 0, stream>>>(router_logits, router_bias, route_ids, route_w);
     p_sort_experts_kernel<<<1, NUM_EXPERTS, 0, stream>>>(
         route_ids, route_w, B, TR, expert_offsets, sorted_tok, sorted_slot, sorted_w);
@@ -1464,10 +1487,10 @@ void launch_prefill_moe_gate_up_h(
     const int32_t* expert_offsets, const int32_t* sorted_tok, const int32_t* sorted_slot,
     __half* out_act_h, int B, cudaStream_t stream) {
     if (w13.is_nvfp4) {
-        if (B <= 512) dispatch_wgemm_tm<0, WgemmMode::Up, HIDDEN, 32>(w13, x_h, expert_offsets, sorted_tok, sorted_slot, nullptr, out_act_h, nullptr, stream);
+        if (prefill_tile_rows(B) == 32) dispatch_wgemm_tm<0, WgemmMode::Up, HIDDEN, 32>(w13, x_h, expert_offsets, sorted_tok, sorted_slot, nullptr, out_act_h, nullptr, stream);
         else          dispatch_wgemm_tm<0, WgemmMode::Up, HIDDEN, 128>(w13, x_h, expert_offsets, sorted_tok, sorted_slot, nullptr, out_act_h, nullptr, stream);
     } else {
-        if (B <= 512) dispatch_wgemm_tm<1, WgemmMode::Up, HIDDEN, 32>(w13, x_h, expert_offsets, sorted_tok, sorted_slot, nullptr, out_act_h, nullptr, stream);
+        if (prefill_tile_rows(B) == 32) dispatch_wgemm_tm<1, WgemmMode::Up, HIDDEN, 32>(w13, x_h, expert_offsets, sorted_tok, sorted_slot, nullptr, out_act_h, nullptr, stream);
         else          dispatch_wgemm_tm<1, WgemmMode::Up, HIDDEN, 128>(w13, x_h, expert_offsets, sorted_tok, sorted_slot, nullptr, out_act_h, nullptr, stream);
     }
 }
@@ -1477,10 +1500,10 @@ void launch_prefill_moe_down_h(
     const int32_t* expert_offsets, const int32_t* sorted_tok, const int32_t* sorted_slot,
     const float* sorted_w, float* out_slots, int B, cudaStream_t stream) {
     if (w2.is_nvfp4) {
-        if (B <= 512) dispatch_wgemm_tm<0, WgemmMode::Down, INTERMEDIATE, 32>(w2, act_h, expert_offsets, sorted_tok, sorted_slot, sorted_w, nullptr, out_slots, stream);
+        if (prefill_tile_rows(B) == 32) dispatch_wgemm_tm<0, WgemmMode::Down, INTERMEDIATE, 32>(w2, act_h, expert_offsets, sorted_tok, sorted_slot, sorted_w, nullptr, out_slots, stream);
         else          dispatch_wgemm_tm<0, WgemmMode::Down, INTERMEDIATE, 128>(w2, act_h, expert_offsets, sorted_tok, sorted_slot, sorted_w, nullptr, out_slots, stream);
     } else {
-        if (B <= 512) dispatch_wgemm_tm<1, WgemmMode::Down, INTERMEDIATE, 32>(w2, act_h, expert_offsets, sorted_tok, sorted_slot, sorted_w, nullptr, out_slots, stream);
+        if (prefill_tile_rows(B) == 32) dispatch_wgemm_tm<1, WgemmMode::Down, INTERMEDIATE, 32>(w2, act_h, expert_offsets, sorted_tok, sorted_slot, sorted_w, nullptr, out_slots, stream);
         else          dispatch_wgemm_tm<1, WgemmMode::Down, INTERMEDIATE, 128>(w2, act_h, expert_offsets, sorted_tok, sorted_slot, sorted_w, nullptr, out_slots, stream);
     }
 }

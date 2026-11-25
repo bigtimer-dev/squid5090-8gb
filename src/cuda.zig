@@ -792,6 +792,9 @@ pub extern "c" fn squid_launch_prefill_controller_one(
     stream: ?*anyopaque,
 ) void;
 
+/// Prefill token-tile default by expert placement: 128-row tiles at every chunk size when any bank is on the host.
+pub extern "c" fn squid_prefill_tiles_set_host_banks(banks_host: i32) void;
+
 pub extern "c" fn squid_launch_prefill_route_and_sort(
     router_logits: [*]const f32,
     router_bias: [*]const f32,
