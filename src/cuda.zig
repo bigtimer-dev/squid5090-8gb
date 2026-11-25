@@ -824,3 +824,26 @@ pub extern "c" fn squid_launch_prefill_moe_down_h(
     batch_size: i32,
     stream: ?*anyopaque,
 ) void;
+
+// --- Vision encoder (cuda/kernels_vision.cu) and image decoding (cpu/image_decode.c) ---
+pub const SquidVisionArgs = extern struct {
+    glob: ?*const anyopaque,
+    layers: ?*const anyopaque,
+    proj: ?*const anyopaque,
+    patches: ?*const anyopaque,
+    rope: ?[*]const f32,
+    out: ?[*]f32,
+    dbg: ?[*]f32,
+    scratch: ?*anyopaque,
+    scratch_bytes: u64,
+    gw: i32,
+    gh: i32,
+};
+pub extern "c" fn squid_vision_layer_bytes() u64;
+pub extern "c" fn squid_vision_glob_bytes() u64;
+pub extern "c" fn squid_vision_proj_bytes() u64;
+pub extern "c" fn squid_vision_scratch_bytes(n_rows: i32) u64;
+pub extern "c" fn squid_vision_forward(args: *const SquidVisionArgs, stream: ?*anyopaque) i32;
+pub extern "c" fn squid_image_probe(buf: [*]const u8, len: usize, w: *c_int, h: *c_int) c_int;
+pub extern "c" fn squid_image_decode_rgb(buf: [*]const u8, len: usize, w: *c_int, h: *c_int) ?[*]u8;
+pub extern "c" fn squid_image_free(p: ?[*]u8) void;

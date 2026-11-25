@@ -8,6 +8,7 @@ const engine_mod = @import("engine.zig");
 const server_mod = @import("server.zig");
 const tiger = @import("tiger.zig");
 const tokenizer_mod = @import("tokenizer.zig");
+const vision_mod = @import("vision.zig");
 const weights_mod = @import("weights.zig");
 
 const bench_runs_max: usize = 64;
@@ -54,6 +55,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var raw_thinking: bool = false;
     var keep_history_thinking: bool = false;
     var has_tokens_arg: bool = false;
+    var image_path: []const u8 = "";
 
     var arg_i: usize = 3;
     while (arg_i < argv.len) : (arg_i += 1) {
@@ -66,6 +68,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             arg_i += 1;
             tokens_file = std.mem.span(argv[arg_i]);
             has_tokens_arg = true;
+        } else if (std.mem.eql(u8, arg, "--image") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            image_path = std.mem.span(argv[arg_i]);
         } else if (std.mem.eql(u8, arg, "--prompt") and arg_i + 1 < argv.len) {
             arg_i += 1;
             prompt_text = std.mem.span(argv[arg_i]);
@@ -138,6 +143,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             keep_history_thinking = true;
         }
     }
+
+    // Vision encoder alone (no language model): encode --image, report timings; SQUID_VISION_DUMP=<prefix> writes
+    // the intermediates and the embeddings for comparison with a reference.
+    if (std.mem.eql(u8, command, "vision-test")) return vision_test(model_directory, image_path, runs);
 
     // Fast tokenizer-only diagnostic & benchmark command (no GPU required)
     if (std.mem.eql(u8, command, "tokenize")) {
@@ -252,6 +261,13 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     defer engine.deinit();
 
     if (std.mem.eql(u8, command, "serve")) {
+        // Images in chat requests (SQUID_VISION=0 turns them off): the encoder borrows the prefill buffers.
+        var vision: vision_mod.Vision = .{};
+        const vision_env = tiger.getenv("SQUID_VISION");
+        if (vision_env == null or !std.mem.eql(u8, std.mem.span(vision_env.?), "0")) {
+            vision.init(model_directory, engine.prefill_region_bytes());
+            engine.vision = &vision;
+        }
         return server_mod.run_openai_server(&engine, &tokenizer, .{
             .host = host,
             .port = port,
@@ -393,6 +409,61 @@ fn parse_csv_tokens(csv: []const u8, out: []i32) usize {
     return count;
 }
 
+fn vision_test(model_directory: []const u8, image_path: []const u8, runs: u32) u8 {
+    if (image_path.len == 0) {
+        tiger.print_stderr("vision-test needs --image PATH\n", .{});
+        return 1;
+    }
+    const buf = tiger.alloc_host_zeroed(u8, 64 * 1024 * 1024);
+    defer tiger.free_host_slice(u8, buf);
+    const bytes = read_file_into(image_path, buf) orelse {
+        tiger.print_stderr("cannot read {s}\n", .{image_path});
+        return 1;
+    };
+    const pr = vision_mod.probe(bytes);
+    if (pr != .ok) {
+        tiger.print_stderr("{s}: {s}\n", .{ image_path, if (pr == .unsupported) "unsupported format" else "broken or oversized image" });
+        return 1;
+    }
+    var scratch_mb: u64 = 722;
+    if (tiger.getenv("SQUID_VISION_SCRATCH_MB")) |v| scratch_mb = std.fmt.parseInt(u64, std.mem.span(v), 10) catch scratch_mb;
+    const scratch_bytes: u64 = scratch_mb << 20;
+    var scratch: ?*anyopaque = null;
+    if (cuda.squid_cuda_malloc(&scratch, scratch_bytes) != 0) {
+        tiger.print_stderr("cannot allocate {d} MiB of VRAM\n", .{scratch_mb});
+        return 1;
+    }
+    var stream: ?*anyopaque = null;
+    tiger.assert_cuda(cuda.squid_cuda_stream_create(&stream));
+    var vis: vision_mod.Vision = .{};
+    vis.init(model_directory, scratch_bytes);
+    const pl = vision_mod.plan(pr.ok.w, pr.ok.h, vis.max_tokens);
+    var img: vision_mod.ImageRef = .{
+        .hash = std.hash.Wyhash.hash(0, bytes),
+        .bytes = bytes,
+        .w = pr.ok.w,
+        .h = pr.ok.h,
+        .tw = pl.tw,
+        .th = pl.th,
+        .gw = pl.gw,
+        .gh = pl.gh,
+        .tokens = pl.tokens,
+    };
+    tiger.print_stdout("[vision-test] {s}: {d}x{d} -> {d}x{d}, grid {d}x{d}, {d} tokens\n", .{ image_path, img.w, img.h, img.tw, img.th, img.gw, img.gh, img.tokens });
+    var r: u32 = 0;
+    while (r < @max(runs, 1)) : (r += 1) {
+        vis.begin_request();
+        img.hash +%= 1; // a miss every run, to time the encoder
+        const t0 = tiger.clock_monotonic_ns();
+        const emb = vis.embeddings(&img, scratch.?, scratch_bytes, stream) orelse return 1;
+        const ms = @as(f64, @floatFromInt(tiger.clock_monotonic_ns() - t0)) / 1e6;
+        var sum: f64 = 0;
+        for (0..@as(usize, img.tokens) * vision_mod.embed_dim) |i| sum += @abs(emb[i]);
+        tiger.print_stdout("[vision-test] run {d}: {d:.1} ms, mean |emb| {d:.5}\n", .{ r, ms, sum / @as(f64, @floatFromInt(@as(usize, img.tokens) * vision_mod.embed_dim)) });
+    }
+    return 0;
+}
+
 fn read_file_into(path: []const u8, buf: []u8) ?[]const u8 {
     var pz: [1024]u8 = undefined;
     if (path.len >= pz.len) return null;
@@ -443,7 +514,8 @@ fn print_usage() void {
             "  squid5090 generate <model_dir> (--prompt TEXT | --tokens CSV | --tokens-file PATH) [--mode nvfp4] [--kv auto] [--mtp 7] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--top-k 0] [--seed N] [--ablation PATH] [--uncensor PATH] [--max-tokens 512] [--ctx 8192]\n" ++
             "  squid5090 bench    <model_dir> (--prompt TEXT | --tokens CSV) [--mode nvfp4] [--kv auto] [--mtp 7] [--spec-threshold 0.80] [--ablation PATH] [--uncensor PATH] [--max-tokens 512] [--runs 6] [--ctx 8192]\n" ++
             "  squid5090 longctx  <model_dir> [--mode nvfp4] [--kv fp8|q4|bf16] [--ctx 1048576]\n" ++
-            "  squid5090 tokenize <model_dir> --prompt TEXT [--raw]\n",
+            "  squid5090 tokenize <model_dir> --prompt TEXT [--raw]\n" ++
+            "  squid5090 vision-test <model_dir> --image PATH [--runs N]   (image encoder only; SQUID_VISION_DUMP=prefix)\n",
     );
 }
 

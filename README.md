@@ -5,6 +5,7 @@
 ## What this fork changes
 
 - **Generation is ~4× faster when the CPU computes the experts that live in RAM** (opt-in, see [Fast generation](#fast-generation-cpu--gpu-experts)): 54–55 tok/s instead of 12.5 on a short prompt at 64K context. While one sequence generates, the CPU computes the routed experts held in host RAM straight from RAM and the GPU computes the rest. Up to ~690 of the most-used host experts are also copied into VRAM that sits idle during generation: the prefill buffers, the unused end of the KV cache, and the slots of the 300 least-used VRAM-layer experts, which the CPU computes instead.
+- **Image input.** Chat requests can carry images in user and tool messages: OpenAI-style `image_url` parts with base64 `data:` URLs, in PNG, JPEG or WebP. Inkling-2-Mini's vision encoder runs on the GPU inside the prefill buffers. Its 609 MiB of weights stay in pinned host RAM and stream over PCIe one layer at a time, so it takes no VRAM and the context stays at 64K. See [Images](#images).
 - **Experts that don't fit in VRAM are read from host RAM.** Upstream keeps every weight in VRAM (15.6 GiB at 8K context). Here, the expert banks beyond the VRAM budget go into one mapped, pinned host buffer that the GPU reads zero-copy over PCIe. VRAM goes to the looped core layers first, because layers 6–17 run three times per token. If everything fits, nothing moves.
 - **`--uncensor PATH` applies the [AtomicChat uncensored LoRA](https://huggingface.co/AtomicChat/Inkling-2-Mini-Uncensored-GGUF) exactly.** That rank-1 LoRA is a projection removal, `y -= b·(b·y)`, on the attention output and on every expert's down projection, plus an edit to the embedding table. A new kernel applies the projection before the short conv. Upstream's `--ablation` hook runs after the conv, so it can't reproduce the LoRA. [`tools/uncensor-lora/`](tools/uncensor-lora/) checks the equivalence on the real weights and bakes the embedding edit into a reflinked copy of the checkpoint.
 - **Loads in 16–18 s instead of ~2.5–3 min.** Layers 20–23 ship as MXFP8 and are converted to NVFP4 at load. For banks bound for host RAM, the conversion now runs in VRAM staging and the result is copied to the host by DMA; storing straight into mapped host memory ran at ~12 MB/s. Large safetensors files are read with `O_DIRECT` through a pinned bounce buffer.
@@ -20,6 +21,8 @@ zig build -Doptimize=ReleaseFast -Dcuda-arch=89 -Dcuda-path=/opt/cuda   # 89 = R
 ./zig-out/bin/squid5090 serve /opt/models/inkling-2-mini \
   --mode nvfp4 --embed-host --mtp 0 --ctx 65536 --kv fp8 --host 127.0.0.1 --port 8080
 ```
+
+Image input links the system libpng, libjpeg-turbo (2.x or 3.x) and libwebp: `libpng libjpeg-turbo libwebp` on Arch, `libpng-dev libturbojpeg0-dev libwebp-dev` on Debian and Ubuntu.
 
 The load log shows the split, for example `[weights] Experts: 18/48 banks in VRAM, 30 in pinned host RAM (8.01 GiB, zero-copy) | host bank-visits/token=42/96`. On an 8 GB card about 10 GiB of RAM is pinned: the offloaded experts, the embedding table and the prompt cache.
 
@@ -65,6 +68,25 @@ Requirements and costs:
 - A fact placed at 50% depth of a 32K-token prompt and at 10% depth of a 61K-token prompt was still retrieved, and tool calls pass, plain and streamed.
 
 **Numerical change in both modes:** decode attention over a long context now splits the context into 24 parts instead of 64, which fills the 4060's 24 SMs in two whole waves. This changes the order of an fp32 merge, so output also differs slightly from upstream's GPU-only path once the context passes 1024 tokens. On 1024 teacher-forced tokens at positions 12.6K–13.6K, GPU-only: mean NLL +0.00003 ± 0.00002 nats, top token 1024/1024, largest change in a token's log-probability 0.012. The split count is `KV_SPLIT_K` in `cuda/config.hpp`; 64 restores upstream's arithmetic.
+
+## Images
+
+Put images in the `content` parts of user or tool messages as `image_url` parts with a base64 data URL. The part types `input_image` and `image` also work. The server doesn't fetch `http(s)` URLs.
+
+```bash
+IMG=$(base64 -w0 photo.jpg)
+curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "user", "content": [
+    {"type": "text", "text": "What is in this picture?"},
+    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,'"$IMG"'"}}]}]}'
+```
+
+- **Token cost:** one prompt token per 40×40 pixels. A 640×480 image is 192 tokens and 1920×1080 is 1296. An image above `SQUID_IMAGE_MAX_TOKENS` (default 1600) is downscaled by area averaging to fit, keeping its aspect ratio; with the default settings the prefill buffers fit at most 3548. Transparent images are composited onto white.
+- **The encoder** is a 23-layer ViT with 2D RoPE, a 2×2 patch merge and a two-layer projector. It runs as FP16 tensor-core GEMMs with FP32 accumulation, an FP32 residual stream and FP32 flash-style attention. The image embeddings replace the placeholder tokens after the token embedding.
+- **Encoder time on the RTX 4060 Laptop:** ~50 ms for a small image (the weights stream over PCIe each time), 70 ms for 640×640, 0.9 s for 1920×1080, and 1.3 s for 4000×3000 (downscaled to 1564 tokens). The first image also loads the weights from the checkpoint, which takes ~1 s.
+- **Caching:** recent images' embeddings are cached by content hash. The prompt cache reuses an image's span across the turns of a conversation only when the same image sits at the same position.
+- **Accuracy:** the encoder matches a float64 NumPy port of llama.cpp's Inkling 2 vision graph to a relative L2 error of 0.07–0.16% on the projector output ([`tools/vision/`](tools/vision/)). `squid5090 vision-test MODEL_DIR --image FILE` runs the encoder alone; `SQUID_VISION_DUMP=prefix` writes its intermediate tensors.
+- **Text-only requests** run exactly as before.
 
 ## Results on the RTX 4060 Laptop (8 GB)
 
@@ -124,6 +146,8 @@ Only `--mode nvfp4` has been tested with the offload.
 | `SQUID_DECODE_CACHE_DEMOTE` | `0` | The CPU computes this many of the least-used VRAM-layer experts (by the prior) from pinned RAM copies, and their VRAM slots cache that many more host experts while generating. Needs `--mtp 0` |
 | `SQUID_DECODE_CACHE_LAZY` | `0` | `1` = refill each request's cache slots in the background (chunks of 32 experts on a second stream) instead of before the second token; experts not landed yet run on the CPU |
 | `SQUID_LOCAL_KV` | `bf16` | `fp8` = K/V of the 40 sliding-window visits as fp8 E4M3 with a per-(token, head) scale: generation +1.9% at 12.6K and +1.5% at 32K. **Lossy**: teacher-forced NLL vs the GPU-only path −0.0048 ± 0.0043 and +0.0067 ± 0.0026 nats (default −0.0039 and +0.0018), top token 995/1024 and 251/256, so it is off by default |
+| `SQUID_VISION` | `1` | `0` = no image input (requests with images get an error) |
+| `SQUID_IMAGE_MAX_TOKENS` | `1600` | Prompt tokens per image; larger images are downscaled |
 | `SQUID_ROUTE_TRACE` | off | Path: write every decode token's top-8 experts per layer visit at exit (input for `tools/decode-cache/route_prior.py`) |
 
 The other `SQUID_CPU_MOE_*` variables and `SQUID_OPROJ_POST_FUSED` (on: o_proj runs inside the post-attention kernel for one token), `SQUID_DECODE_BANK`, `SQUID_DECODE_CACHE_TAIL_CHECK`, `SQUID_DECODE_CACHE_HOLE_CHECK`, `SQUID_E2M1_LUT`, `SQUID_HOST_THP`, `SQUID_BLOCKING_SYNC`, `SQUID_ENGINE_CPU`, `SQUID_ATTN_NO_PREFETCH` and `SQUID_SCORE_*` are experiment or diagnostic switches. Their defaults are the measured best.

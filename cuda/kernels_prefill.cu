@@ -1243,6 +1243,9 @@ p_flash_attn_prefill_tc_kernel(
 
 } // namespace
 
+// The one cuBLAS handle (and workspace) is shared with the vision encoder (kernels_vision.cu).
+void* prefill_cublas_handle(cudaStream_t stream) { return get_cublas(stream); }
+
 void launch_prefill_warmup_cublas(cudaStream_t stream) {
     cublasHandle_t h = get_cublas(stream);
     void* d_tmp = nullptr;

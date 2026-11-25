@@ -55,6 +55,7 @@ pub fn build(b: *std.Build) void {
         .{ .src = "cuda/kernels_prefill.cu", .obj = "kernels_prefill.o" },
         .{ .src = "cuda/cuda_abi.cu", .obj = "cuda_abi.o" },
         .{ .src = "cuda/kernels_cpumoe.cu", .obj = "kernels_cpumoe.o" },
+        .{ .src = "cuda/kernels_vision.cu", .obj = "kernels_vision.o" },
     };
 
     for (cuda_sources) |cu| {
@@ -81,6 +82,8 @@ pub fn build(b: *std.Build) void {
 
     // CPU expert compute for decode (AVX-512 with a scalar fallback, chosen at run time).
     root_module.addCSourceFile(.{ .file = b.path("cpu/cpu_moe.c"), .flags = &.{ "-O3", "-std=gnu11", "-fno-strict-aliasing" } });
+    // Image decoding for vision requests: the system libpng, libjpeg-turbo and libwebp (PNG, JPEG, WebP from memory).
+    root_module.addCSourceFile(.{ .file = b.path("cpu/image_decode.c"), .flags = &.{ "-O2", "-std=gnu11" } });
     root_module.addIncludePath(b.path("cpu"));
 
     root_module.addLibraryPath(.{ .cwd_relative = cuda_lib });
@@ -89,6 +92,9 @@ pub fn build(b: *std.Build) void {
     root_module.linkSystemLibrary("stdc++", .{});
     root_module.linkSystemLibrary("m", .{});
     root_module.linkSystemLibrary("pthread", .{});
+    root_module.linkSystemLibrary("png16", .{});
+    root_module.linkSystemLibrary("turbojpeg", .{});
+    root_module.linkSystemLibrary("webp", .{});
 
     const exe = b.addExecutable(.{
         .name = "squid5090",

@@ -8,8 +8,10 @@ const constants = @import("constants.zig");
 const engine_mod = @import("engine.zig");
 const tiger = @import("tiger.zig");
 const tokenizer_mod = @import("tokenizer.zig");
+const vision_mod = @import("vision.zig");
 
-const request_buffer_bytes: usize = 8 * 1024 * 1024;
+const request_buffer_bytes: usize = 64 * 1024 * 1024; // images arrive as base64 data URLs
+const image_bytes_max: usize = 48 * 1024 * 1024; // decoded image files of one request
 const prompt_render_bytes: usize = 8 * 1024 * 1024;
 const response_buffer_bytes: usize = 8 * 1024 * 1024;
 const content_buffer_bytes: usize = 4 * 1024 * 1024;
@@ -94,6 +96,8 @@ const ServerBuffers = struct {
     sse_buf: []u8,
     prompt_tokens: []i32,
     tok_scratch: tokenizer_mod.TokenizerScratch,
+    image_bytes: []u8,
+    images: []vision_mod.ImageRef,
 
     fn init() ServerBuffers {
         return .{
@@ -108,6 +112,8 @@ const ServerBuffers = struct {
             .sse_buf = tiger.alloc_host_zeroed(u8, sse_frame_bytes),
             .prompt_tokens = tiger.alloc_host_zeroed(i32, prompt_tokens_max),
             .tok_scratch = tokenizer_mod.TokenizerScratch.init(),
+            .image_bytes = tiger.alloc_host_zeroed(u8, image_bytes_max),
+            .images = tiger.alloc_host_zeroed(vision_mod.ImageRef, vision_mod.images_per_request_max),
         };
     }
 
@@ -122,6 +128,8 @@ const ServerBuffers = struct {
         tiger.free_host_slice(u8, self.scratch_str_buf);
         tiger.free_host_slice(u8, self.sse_buf);
         tiger.free_host_slice(i32, self.prompt_tokens);
+        tiger.free_host_slice(u8, self.image_bytes);
+        tiger.free_host_slice(vision_mod.ImageRef, self.images);
         self.tok_scratch.deinit();
     }
 };
@@ -656,6 +664,7 @@ fn handle_chat_completions(
 
     // Render Inkling-2-Mini chat template directly into static render_buf!
     var render_writer = tiger.ByteWriter.init(buffers.render_buf);
+    var imgs: ImageCollector = .{ .vision = engine.vision, .bytes_buf = buffers.image_bytes, .refs = buffers.images };
     const sys_prefix_bytes: usize = render_chat_template_zero_alloc(
         &render_writer,
         messages_json,
@@ -663,10 +672,20 @@ fn handle_chat_completions(
         effort,
         config.keep_history_thinking,
         buffers.scratch_str_buf,
+        &imgs,
     );
+    if (imgs.err) |msg| {
+        send_error_json(fd, 400, msg, "invalid_request_error", buffers.response_buf);
+        return;
+    }
+    if (imgs.count > 0 and !engine.vision.?.ready()) {
+        send_error_json(fd, 500, "The image encoder could not be loaded (see the server log)", "server_error", buffers.response_buf);
+        return;
+    }
     if (!enable_thinking) {
         render_writer.append_slice("<|message_model|><|content_text|>");
     }
+    if (imgs.count > 0) defuse_stray_placeholders(buffers.render_buf[0..render_writer.length], imgs.ph_offsets[0..imgs.count]);
     const rendered = render_writer.slice();
 
     // Encode system+tools prefix first (clean special-token boundary <|end_message|>) to pass exact checkpoint hint!
@@ -680,10 +699,18 @@ fn handle_chat_completions(
     } else {
         prompt_len = tokenizer.encode_into(rendered, true, &buffers.tok_scratch, buffers.prompt_tokens);
     }
+    if (imgs.count > 0) {
+        prompt_len = expand_image_placeholders(buffers.prompt_tokens, prompt_len, imgs.refs[0..imgs.count]) orelse {
+            send_error_json(fd, 400, "The images could not be placed in the prompt (too long?)", "invalid_request_error", buffers.response_buf);
+            return;
+        };
+    }
     if (prompt_len == 0 or prompt_len >= config.context_tokens_max) {
         send_error_json(fd, 400, "Prompt empty or exceeds max_context", "invalid_request_error", buffers.response_buf);
         return;
     }
+    engine.images = imgs.refs[0..imgs.count];
+    defer engine.images = &.{};
     const max_room: u32 = config.context_tokens_max - @as(u32, @intCast(prompt_len));
     const gen_limit: u32 = @min(@as(u32, @intCast(max_tokens)), max_room);
 
@@ -736,6 +763,11 @@ fn handle_chat_completions(
             NonStreamCtx.on_token,
             @ptrCast(&ctx),
         );
+        if (stats.image_error) {
+            send_error_json(fd, 400, "An image could not be decoded or encoded (see the server log)", "invalid_request_error", buffers.response_buf);
+            return;
+        }
+        log_images(&stats, imgs.count);
 
         const hit_eos: bool = (stats.last_token_id == constants.eos_token_id);
         const finish_reason: []const u8 = if (parser.tool_call_count > 0) "tool_calls" else if (ctx.hit_stop or hit_eos) "stop" else "length";
@@ -878,6 +910,11 @@ fn handle_chat_completions(
         @ptrCast(&sctx),
     );
     if (!sctx.conn_ok) return;
+    if (stats.image_error) {
+        _ = send_all(fd, "data: {\"error\":{\"message\":\"An image could not be decoded or encoded (see the server log)\",\"type\":\"invalid_request_error\"}}\n\ndata: [DONE]\n\n");
+        return;
+    }
+    log_images(&stats, imgs.count);
 
     if (stops.count > 0 and !sctx.hit_stop and sctx.emitted_len < parser.content_writer.length) {
         const rem = parser.content_writer.slice()[sctx.emitted_len..];
@@ -1208,6 +1245,7 @@ fn render_chat_template_zero_alloc(
     effort: []const u8,
     keep_history_thinking: bool,
     scratch: []u8,
+    imgs: *ImageCollector,
 ) usize {
     if (tools_json.len > 2 and tools_json[0] == '[') {
         out.append_slice("<|message_system|>tool_declare<|content_xml|>[");
@@ -1342,7 +1380,19 @@ fn render_chat_template_zero_alloc(
                         const ps_start = ap;
                         tokenizer_mod.skip_json_value(c_raw, &ap);
                         const part_obj = c_raw[ps_start..ap];
-                        if (extract_string_field(part_obj, "text", scratch)) |ts| {
+                        var ptype_buf: [32]u8 = undefined;
+                        const ptype = extract_string_field(part_obj, "type", &ptype_buf) orelse "";
+                        if (std.mem.eql(u8, ptype, "image_url") or std.mem.eql(u8, ptype, "input_image") or std.mem.eql(u8, ptype, "image")) {
+                            if (!std.mem.eql(u8, role, "user") and !std.mem.eql(u8, role, "tool")) {
+                                imgs.fail("Image content is only supported for user and tool messages");
+                            } else if (imgs.add(part_obj)) {
+                                out.append_slice(role_tok);
+                                if (resolved_name) |nm| out.append_slice(nm);
+                                out.append_slice("<|content_image|>");
+                                imgs.ph_offsets[imgs.count - 1] = out.length;
+                                out.append_slice("<|unused_200054|><|end_message|>");
+                            }
+                        } else if (extract_string_field(part_obj, "text", scratch)) |ts| {
                             out.append_slice(role_tok);
                             if (resolved_name) |nm| out.append_slice(nm);
                             out.append_slice("<|content_text|>");
@@ -1416,6 +1466,155 @@ fn render_chat_template_zero_alloc(
         system_prefix_bytes = out.length;
     }
     return system_prefix_bytes;
+}
+
+/// The images of one request, gathered while the chat template renders: base64 data URLs decoded into
+/// `bytes_buf`, probed and planned (token count) with the vision module.
+const ImageCollector = struct {
+    vision: ?*vision_mod.Vision,
+    bytes_buf: []u8,
+    refs: []vision_mod.ImageRef,
+    used: usize = 0,
+    count: usize = 0,
+    err: ?[]const u8 = null,
+    ph_offsets: [vision_mod.images_per_request_max]usize = undefined, // where each image's placeholder was rendered
+
+    fn fail(self: *ImageCollector, msg: []const u8) void {
+        if (self.err == null) self.err = msg;
+    }
+
+    /// An image content part ({"type":"image_url","image_url":{"url":"data:image/png;base64,..."}} and the
+    /// input_image / image variants). True when it was taken (the caller emits its placeholder).
+    fn add(self: *ImageCollector, part_obj: []const u8) bool {
+        if (self.err != null) return false;
+        const vis = self.vision orelse {
+            self.fail("This server was started without image support");
+            return false;
+        };
+        var raw: ?[]const u8 = extract_raw_field(part_obj, "image_url");
+        if (raw) |obj| {
+            if (obj.len > 0 and obj[0] == '{') raw = extract_raw_field(obj, "url");
+        }
+        if (raw == null) raw = extract_raw_field(part_obj, "image");
+        if (raw == null) raw = extract_raw_field(part_obj, "url");
+        const r = raw orelse {
+            self.fail("Image part without an image_url");
+            return false;
+        };
+        if (r.len < 2 or r[0] != '"' or r[r.len - 1] != '"') {
+            self.fail("Image part without an image_url");
+            return false;
+        }
+        const url = r[1 .. r.len - 1];
+        var payload: []const u8 = url;
+        if (std.mem.startsWith(u8, url, "data:")) {
+            const comma = std.mem.indexOfScalar(u8, url, ',') orelse {
+                self.fail("Malformed image data URL");
+                return false;
+            };
+            if (std.mem.indexOf(u8, url[0..comma], ";base64") == null) {
+                self.fail("Image data URLs must be base64");
+                return false;
+            }
+            payload = url[comma + 1 ..];
+        } else if (std.mem.startsWith(u8, url, "http://") or std.mem.startsWith(u8, url, "https://")) {
+            self.fail("Images must be sent inline as base64 data URLs (this server does not fetch URLs)");
+            return false;
+        }
+        if (self.count >= self.refs.len) {
+            self.fail("Too many images in one request (64 at most)");
+            return false;
+        }
+        const n = vision_mod.base64_decode(payload, self.bytes_buf[self.used..]) orelse {
+            self.fail("Image data is not valid base64, or the request's images exceed 48 MiB");
+            return false;
+        };
+        const bytes = self.bytes_buf[self.used .. self.used + n];
+        switch (vision_mod.probe(bytes)) {
+            .unsupported => {
+                self.fail("Unsupported image format (PNG, JPEG or WebP)");
+                return false;
+            },
+            .broken => {
+                self.fail("The image could not be read, or is larger than 16384 pixels a side / 64 MP");
+                return false;
+            },
+            .ok => |d| {
+                const pl = vision_mod.plan(d.w, d.h, vis.max_tokens);
+                self.refs[self.count] = .{
+                    .hash = std.hash.Wyhash.hash(0x5157_1d00, bytes),
+                    .bytes = bytes,
+                    .w = d.w,
+                    .h = d.h,
+                    .tw = pl.tw,
+                    .th = pl.th,
+                    .gw = pl.gw,
+                    .gh = pl.gh,
+                    .tokens = pl.tokens,
+                };
+                self.count += 1;
+                self.used += n;
+                return true;
+            },
+        }
+    }
+};
+
+/// With images in the request, the rendered prompt's placeholders must be the images' own: any other
+/// "<|unused_200054|>" (message text that spells it, e.g. this file read by a coding agent) loses its leading '<'
+/// so that it tokenizes as plain text. Text-only requests are left as they are.
+fn defuse_stray_placeholders(text: []u8, real: []const usize) void {
+    const ph = "<|unused_200054|>";
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, text, from, ph)) |at| {
+        if (std.mem.indexOfScalar(usize, real, at) == null) text[at] = '{';
+        from = at + ph.len;
+    }
+}
+
+fn is_image_placeholder(tokens: []const i32, i: usize) bool {
+    return tokens[i] == vision_mod.placeholder_token and i > 0 and tokens[i - 1] == vision_mod.content_image_token;
+}
+
+fn count_image_placeholders(tokens: []const i32) usize {
+    var n: usize = 0;
+    for (0..tokens.len) |i| {
+        if (is_image_placeholder(tokens, i)) n += 1;
+    }
+    return n;
+}
+
+/// Each image's one placeholder token becomes `tokens` of them, in place; records where each image starts.
+/// Null when the placeholders do not match the images one to one, or the result does not fit.
+fn expand_image_placeholders(buf: []i32, len: usize, refs: []vision_mod.ImageRef) ?usize {
+    if (count_image_placeholders(buf[0..len]) != refs.len) return null;
+    var extra: usize = 0;
+    for (refs) |im| extra += im.tokens - 1;
+    const new_len = len + extra;
+    if (new_len > buf.len) return null;
+    var write: usize = new_len;
+    var read: usize = len;
+    var k: usize = refs.len;
+    while (read > 0) {
+        read -= 1;
+        if (k > 0 and is_image_placeholder(buf, read)) {
+            k -= 1;
+            const n: usize = refs[k].tokens;
+            write -= n;
+            @memset(buf[write .. write + n], vision_mod.placeholder_token);
+            refs[k].start = @intCast(write);
+        } else {
+            write -= 1;
+            buf[write] = buf[read];
+        }
+    }
+    tiger.assert(k == 0 and write == 0);
+    return new_len;
+}
+
+fn log_images(stats: *const engine_mod.GenerateStats, count: usize) void {
+    if (count == 0) return;
+    tiger.print_stdout("[http] images: {d} in the prompt, {d} encoded ({d:.0} ms incl. any cached)\n", .{ count, stats.images_encoded, stats.image_ms });
 }
 
 fn resolve_tool_name_by_id(prior_messages_prefix: []const u8, target_id: []const u8, out_buf: []u8) ?[]const u8 {

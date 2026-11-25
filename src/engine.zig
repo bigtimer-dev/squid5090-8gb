@@ -8,6 +8,7 @@ const cuda = @import("cuda.zig");
 const tiger = @import("tiger.zig");
 const vram_arena = @import("vram_arena.zig");
 const weights_mod = @import("weights.zig");
+const vision_mod = @import("vision.zig");
 
 pub const TokenCallbackFn = *const fn (context: *anyopaque, token_id: i32) bool;
 
@@ -29,6 +30,9 @@ pub const GenerateStats = struct {
     total_drafts: u32 = 0,
     total_accepted: u32 = 0,
     last_token_id: i32 = -1,
+    image_error: bool = false, // an image could not be decoded or encoded: nothing was generated
+    images_encoded: u32 = 0,
+    image_ms: f64 = 0.0,
 };
 
 /// Zero-malloc O(1) n-gram prompt-lookup drafter (inspired by Atomic Engine's hybrid lookup + DSpark fallback).
@@ -423,6 +427,15 @@ pub const Engine = struct {
     p_tokens: [*]i32 = undefined,
     p_pos_vec: [*]i32 = undefined,
     p_hidden: [*]f32 = undefined,
+    // Images in the prompt (vision.zig): the server sets `images` for one request; `img_rows` are the embeddings of
+    // those the prefill reaches (null for images inside a reused prefix), written over their placeholders' rows
+    // after the token embedding. The encoder runs in the prefill buffers before the prefill.
+    vision: ?*vision_mod.Vision = null,
+    images: []const vision_mod.ImageRef = &.{},
+    img_rows: [vision_mod.images_per_request_max]?[*]const f32 = @splat(null),
+    img_inject_pos: i64 = -1, // B <= 8 forward: prompt index of row 0 when the batch holds image rows
+    session_images: [vision_mod.images_per_request_max]vision_mod.SessionImage = undefined,
+    session_image_count: u32 = 0,
     p_prelude: [*]f32 = undefined,
     p_partial: [*]f32 = undefined,
     p_blocks: [*]f32 = undefined,
@@ -2324,6 +2337,10 @@ pub const Engine = struct {
         const num_drafts: u32 = if (num_drafts_in > constants.mtp_draft_count_max) constants.mtp_draft_count_max else num_drafts_in;
         const use_mtp: bool = (num_drafts > 0 and w.dspark.loaded != 0);
         const prompt_len: u32 = @intCast(prompt.len);
+        if (self.images.len > 0 and (self.vision == null or self.images.len > vision_mod.images_per_request_max or !self.vision.?.ready())) {
+            stats.image_error = true;
+            return stats;
+        }
         self.reset_decode_cache_session(@max(prompt_len, self.prefix_cache.session_len));
 
         // Upload per-request sampling config to device (zero CUDA graph rebuild!).
@@ -2345,6 +2362,7 @@ pub const Engine = struct {
             const max_match: u32 = @min(self.prefix_cache.session_len, if (prompt_len > 1) prompt_len - 1 else 0);
             var common: u32 = 0;
             while (common < max_match and self.prefix_cache.session_tokens[common] == prompt[common]) : (common += 1) {}
+            common = self.image_safe_common(common);
 
             // Short non-matching side request while holding a long session? Shield global KV prefix!
             // Fork: shield whenever the side *prompt* fits. Clients such as OpenCode send title requests with a large
@@ -2408,6 +2426,24 @@ pub const Engine = struct {
             self.prefix_cache.gpu_live_at_pos = -1;
         };
 
+        // --- IMAGES: embeddings for those the prefill reaches (cached, or the encoder runs in the prefill buffers) ---
+        if (self.images.len > 0) {
+            const t_img = tiger.clock_monotonic_ns();
+            const before = self.vision.?.encodes;
+            if (!self.prepare_images(start_pos)) {
+                // Nothing of this prompt was written yet, but the cache matching may have moved the state: drop it.
+                self.prefix_cache.session_len = 0;
+                self.session_image_count = 0;
+                for (&self.prefix_cache.checkpoints) |*ckpt| ckpt.valid = false;
+                self.prefix_cache.gpu_live_at_pos = -1;
+                self.reset();
+                stats.image_error = true;
+                return stats;
+            }
+            stats.images_encoded = @intCast(self.vision.?.encodes - before);
+            stats.image_ms = @as(f64, @floatFromInt(tiger.clock_monotonic_ns() - t_img)) / 1_000_000.0;
+        }
+
         // --- PREFILL (ONLY prompt[start_pos .. prompt_len]) ---
         const rem_tokens: u32 = prompt_len - start_pos;
         if (self.use_graphs and rem_tokens > constants.mtp_block_size_max) {
@@ -2452,6 +2488,8 @@ pub const Engine = struct {
         if (self.prefix_cache.enabled and shield_tokens == 0) {
             @memcpy(self.prefix_cache.session_tokens[start_pos..prompt_len], prompt[start_pos..prompt_len]);
             self.prefix_cache.session_len = prompt_len;
+            self.session_image_count = @intCast(self.images.len);
+            for (self.images, 0..) |im, k| self.session_images[k] = .{ .start = im.start, .tokens = im.tokens, .hash = im.hash };
             self.prefix_cache.session_use_mtp = use_mtp;
             self.prefix_cache.gpu_live_at_pos = @intCast(prompt_len);
             for (&self.prefix_cache.checkpoints) |*ckpt| {
@@ -2718,6 +2756,84 @@ pub const Engine = struct {
         return stats;
     }
 
+    /// Longest prefix the cached session can share once images are taken into account: the placeholder tokens are
+    /// the same for every image, so a span must be the same image at the same position on both sides.
+    fn image_safe_common(self: *const Engine, common_in: u32) u32 {
+        var common = common_in;
+        for (self.session_images[0..self.session_image_count]) |si| {
+            if (si.start >= common) continue;
+            var same = false;
+            for (self.images) |im| {
+                if (im.start == si.start) {
+                    same = (im.hash == si.hash and im.tokens == si.tokens);
+                    break;
+                }
+            }
+            if (!same) common = si.start;
+        }
+        for (self.images) |im| {
+            if (im.start >= common) continue;
+            var found = false;
+            for (self.session_images[0..self.session_image_count]) |si| {
+                if (si.start == im.start) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) common = im.start;
+        }
+        return common;
+    }
+
+    /// Embeddings of the images the prefill from `start_pos` reaches. The encoder (when they are not cached) uses
+    /// the prefill buffers, like a prefill chunk: the decode bank / cache copies there are gone afterwards.
+    fn prepare_images(self: *Engine, start_pos: u32) bool {
+        const vis = self.vision.?;
+        vis.begin_request();
+        const region: *anyopaque = @ptrCast(self.p_tokens);
+        const region_end: usize = @intFromPtr(self.arena.base_ptr.?) + @as(usize, @intCast(self.arena.capacity_bytes));
+        const have: u64 = region_end - @intFromPtr(region);
+        for (self.images, 0..) |*im, k| {
+            self.img_rows[k] = null;
+            if (im.start + im.tokens <= start_pos) continue;
+            self.dbank_valid = false; // as before a prefill chunk: the region holds the decode bank / cache
+            self.dcache_holes_restore();
+            self.dcache_valid = false;
+            self.img_rows[k] = vis.embeddings(im, region, have, self.stream) orelse return false;
+        }
+        return true;
+    }
+
+    /// Bytes of the prefill buffers (the tail of the runtime arena), which the image encoder borrows.
+    pub fn prefill_region_bytes(self: *const Engine) u64 {
+        const region_end: usize = @intFromPtr(self.arena.base_ptr.?) + @as(usize, @intCast(self.arena.capacity_bytes));
+        return region_end - @intFromPtr(self.p_tokens);
+    }
+
+    fn images_overlap(self: *const Engine, pos0: u32, count: u32) bool {
+        for (self.images) |im| {
+            if (im.start < pos0 + count and pos0 < im.start + im.tokens) return true;
+        }
+        return false;
+    }
+
+    /// Rows [pos0, pos0 + count) of the prompt in `dst` (just embedded): image rows get their embeddings instead
+    /// (no token embedding norm, as the reference feeds them).
+    fn inject_image_rows(self: *Engine, dst: [*]f32, pos0: u32, count: u32) void {
+        for (self.images, 0..) |im, k| {
+            const a: u32 = @max(pos0, im.start);
+            const b: u32 = @min(pos0 + count, im.start + im.tokens);
+            if (a >= b) continue;
+            const rows = self.img_rows[k].?; // every image the prefill reaches has them (prepare_images)
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(
+                @ptrCast(dst + @as(usize, a - pos0) * constants.hidden_dim),
+                @ptrCast(rows + @as(usize, a - im.start) * constants.hidden_dim),
+                @as(usize, b - a) * constants.hidden_dim * 4,
+                self.stream,
+            ));
+        }
+    }
+
     fn prefill_range(self: *Engine, prompt: []const i32, start_i: u32, end_i: u32, use_mtp: bool, compute_last_lm: bool) u32 {
         tiger.assert(end_i >= start_i);
         self.dcache_holes_restore();
@@ -2730,7 +2846,7 @@ pub const Engine = struct {
             self.prefill_chunk_batched(prompt, i, chunk, use_mtp);
             i += chunk;
         }
-        if (self.use_graphs and end_i - i >= constants.mtp_block_size_max) {
+        if (self.use_graphs and end_i - i >= constants.mtp_block_size_max and !self.images_overlap(i, end_i - i)) {
             const pgraph = self.prefill_b8_graph_exec[if (use_mtp) 1 else 0].?;
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
             while (i + constants.mtp_block_size_max <= end_i and (!compute_last_lm or i + constants.mtp_block_size_max < end_i)) {
@@ -2750,7 +2866,9 @@ pub const Engine = struct {
             const is_last: bool = compute_last_lm and (i + batch == end_i);
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_tokens), @ptrCast(prompt[i..].ptr), batch * @sizeOf(i32), self.stream));
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
+            self.img_inject_pos = if (self.images_overlap(i, batch)) i else -1;
             self.record_target_forward(@intCast(batch), use_mtp, is_last);
+            self.img_inject_pos = -1;
             self.current_position += @intCast(batch);
             i += batch;
         }
@@ -2769,7 +2887,7 @@ pub const Engine = struct {
             self.prefill_chunk_batched(prompt, i, chunk, use_mtp);
             i += chunk;
         }
-        if (self.use_graphs and prompt_len - i > constants.mtp_block_size_max) {
+        if (self.use_graphs and prompt_len - i > constants.mtp_block_size_max and !self.images_overlap(i, prompt_len - i)) {
             const pgraph = self.prefill_b8_graph_exec[if (use_mtp) 1 else 0].?;
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
             while (i + constants.mtp_block_size_max < prompt_len) {
@@ -2790,7 +2908,9 @@ pub const Engine = struct {
             const is_last: bool = (i + batch == prompt_len);
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_tokens), @ptrCast(prompt[i..].ptr), batch * @sizeOf(i32), self.stream));
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
+            self.img_inject_pos = if (self.images_overlap(i, batch)) i else -1;
             self.record_target_forward(@intCast(batch), use_mtp, is_last);
+            self.img_inject_pos = -1;
             self.current_position += @intCast(batch);
             i += batch;
             last_batch = batch;
@@ -2820,6 +2940,7 @@ pub const Engine = struct {
         tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.p_tokens), @ptrCast(prompt[start_i..].ptr), b_usize * @sizeOf(i32), self.stream));
 
         cuda.squid_launch_embed_norm(w.embed.?, w.embed_norm.?, self.p_tokens, self.p_hidden, b_i32, self.stream);
+        if (self.images.len > 0) self.inject_image_rows(self.p_hidden, start_i, chunk_len);
 
         var block_count: i32 = 0;
         var has_prior: bool = false;
@@ -3496,6 +3617,7 @@ pub const Engine = struct {
         const moe_slotted: u8 = 0;
 
         cuda.squid_launch_embed_norm(w.embed.?, w.embed_norm.?, self.d_tokens, self.hidden, batch_size, self.stream);
+        if (self.img_inject_pos >= 0) self.inject_image_rows(self.hidden, @intCast(self.img_inject_pos), @intCast(batch_size));
 
         var block_count: i32 = 0;
         var has_prior: bool = false;
