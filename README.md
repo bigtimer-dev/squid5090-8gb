@@ -74,14 +74,13 @@ Both engines got the same prompts: 64K context, 8-bit KV cache, the uncensored m
 |---|---:|---:|---:|
 | Generation, short prompt | 18.6 tok/s | 12.5 tok/s | **54–55 tok/s** |
 | Generation after 12.6K tokens of context | 15.9 tok/s | 12.2 tok/s | **46.9 tok/s** |
-| Generation after 32K tokens of context | — | — | **40.6 tok/s**\* |
+| Generation after 32K tokens of context | — | — | **42.4 tok/s** |
 | Generation after 46K tokens of context | — | 11.7 tok/s | — |
-| Generation after 64K tokens of context | — | — | **35.6 tok/s**\* |
+| Generation after 64K tokens of context | — | — | **37.1 tok/s** |
 | Reading a 3.8K-token prompt | 76 tok/s (51 s) | **509 tok/s (7.5 s)** | same path |
 | Reading a 12.6K-token prompt | 70 tok/s (181 s) | **495 tok/s (25.5 s)** | **500 tok/s (25.2 s)** |
 | Reading a 46K-token prompt | — | **500 tok/s (93 s)** | same path |
-
-\* Measured before `SQUID_DECODE_CACHE_DEMOTE`.
+| Reading a 64K-token prompt | — | — | **498 tok/s (128 s)** |
 
 With CPU + GPU experts the short-prompt speed is ~2 tok/s lower at first than after a few minutes of steady load. The change follows the CPU's RAM bandwidth, which rises from ~48 to ~54 GB/s; the cause is unknown and is not temperature.
 
