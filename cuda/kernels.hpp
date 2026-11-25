@@ -237,8 +237,11 @@ void launch_attn_prep_store(
     const float* cv,            // [B, KV_DIM]
     const __nv_bfloat16* q_clip_scale,
     const __nv_bfloat16* rel_clip_scale,
-    __nv_bfloat16* k_cache,     // [cap, KV_DIM]
-    __nv_bfloat16* v_cache,     // [cap, KV_DIM]
+    void* k_cache,              // [cap, KV_DIM] (bf16, or fp8 + k_scale [cap, NUM_KV_HEADS])
+    void* v_cache,              // [cap, KV_DIM]
+    __half* k_scale,
+    __half* v_scale,
+    KVFormat kv_fmt,            // BF16 or FP8
     int kv_cap,
     bool is_global,
     int B, const int32_t* d_pos,
@@ -396,8 +399,11 @@ void launch_mega_local_sconv_prep_store(
     float* v_ring,
     const __nv_bfloat16* q_clip_scale,
     const __nv_bfloat16* rel_clip_scale,
-    __nv_bfloat16* k_cache,
-    __nv_bfloat16* v_cache,
+    void* k_cache,
+    void* v_cache,
+    __half* k_scale,             // fp8: per-(slot, KV head) scales; bf16: unused
+    __half* v_scale,
+    KVFormat kv_fmt,             // BF16 or FP8 (SQUID_LOCAL_KV)
     int kv_cap,
     int B, const int32_t* d_pos,
     cudaStream_t stream);
@@ -552,8 +558,11 @@ void launch_prefill_local_sconv_prep_store(
     float* v_ring,
     const __nv_bfloat16* q_clip_scale,
     const __nv_bfloat16* rel_clip_scale,
-    __nv_bfloat16* k_cache,
-    __nv_bfloat16* v_cache,
+    void* k_cache,
+    void* v_cache,
+    __half* k_scale,
+    __half* v_scale,
+    KVFormat kv_fmt,
     int kv_cap,
     int B,
     const int32_t* d_pos,
