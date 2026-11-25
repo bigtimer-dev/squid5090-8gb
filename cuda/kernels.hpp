@@ -424,6 +424,15 @@ void launch_mega_attn_post_mlp_in(
     const float* udir, // B = 1 only: uncensor direction, projected out of the input row before the conv (nullptr: none)
     cudaStream_t stream);
 
+// B = 1, o_proj (nvfp4, K = 3072) + launch_mega_attn_post_mlp_in in one launch (other weights: the two launches).
+void launch_oproj_attn_post_b1(
+    const LinearWeight& w_o, const __half* x_h,
+    float* o_proj, const __nv_bfloat16* attn_sconv_w, float* attn_ring,
+    const float* hidden, const float* partial_prev, float* blocks, int block_count_before, bool is_boundary,
+    float* residual_out, const float* mlp_query, const __nv_bfloat16* mlp_norm_w,
+    float* mlp_out, __half* mlp_out_h, const int32_t* d_pos,
+    const float* abl_r, const float* abl_d, const float* abl_p, const float* udir, cudaStream_t stream);
+
 // MEGA-FUSION 4: mlp_sconv + residual add -> hidden (supports deterministic 8-slot reduction when B>1!)
 void launch_mega_mlp_post_res(
     const float* moe_down_or_slots,

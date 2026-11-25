@@ -372,6 +372,7 @@ pub const Engine = struct {
     route_ids: [*]i32 = undefined,
     route_ctr: ?[*]u32 = null, // device [16]: last-block counter of the fused B = 1 router (SQUID_ROUTE_FUSED)
     route_fused: bool = false,
+    oproj_post_fused: bool = false,
     route_w: [*]f32 = undefined,
     exp_groups: *anyopaque = undefined,
     moe_act_h: *anyopaque = undefined,
@@ -557,6 +558,7 @@ pub const Engine = struct {
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(@ptrCast(self.route_ctr.?), @ptrCast(&zeros), @sizeOf(@TypeOf(zeros))));
         }
         self.route_fused = if (tiger.getenv("SQUID_ROUTE_FUSED")) |v| v[0] != '0' else true;
+        self.oproj_post_fused = if (tiger.getenv("SQUID_OPROJ_POST_FUSED")) |v| v[0] != '0' else true;
         self.exp_groups = self.arena.alloc_raw(expert_groups_bytes);
         self.moe_act_h = self.arena.alloc_raw(b_max * constants.top_k_experts * constants.intermediate_dim * 2);
         self.moe_down = self.arena.alloc_many(f32, b_max * constants.hidden_dim);
@@ -3572,7 +3574,11 @@ pub const Engine = struct {
                 self.stream,
             );
 
-            if (use_half_dense) {
+            // B = 1 nvfp4: o_proj is computed inside the mega_attn_post_mlp_in launch below (SQUID_OPROJ_POST_FUSED).
+            const oproj_fused = self.oproj_post_fused and batch_size == 1 and use_half_dense and
+                lw.w_o.kind == @intFromEnum(constants.WeightKind.nvfp4) and lw.w_o.cols == 3072 and
+                lw.w_o.rows == @as(i32, constants.hidden_dim);
+            if (oproj_fused) {} else if (use_half_dense) {
                 cuda.squid_launch_linear_h(&lw.w_o, self.attn_gated_h, self.o_proj, batch_size, 0, self.stream);
             } else {
                 cuda.squid_launch_linear(&lw.w_o, self.attn_gated, self.o_proj, batch_size, 0, self.stream);
@@ -3585,7 +3591,9 @@ pub const Engine = struct {
 
             const is_boundary: bool = (l % constants.block_layer_count == 0);
             const attn_abl = ablation_slice(w, false, vi);
-            cuda.squid_launch_mega_attn_post_mlp_in(
+            cuda.squid_launch_mega_attn_post_mlp_in_x(
+                if (oproj_fused) &lw.w_o else null,
+                self.attn_gated_h,
                 self.o_proj,
                 lw.attn_sconv_w.?,
                 self.attn_ring[vi],

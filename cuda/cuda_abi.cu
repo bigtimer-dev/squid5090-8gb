@@ -715,6 +715,27 @@ void squid_launch_mega_attn_post_mlp_in(
         B, d_pos, abl_r, abl_d, abl_p, udir, static_cast<cudaStream_t>(stream));
 }
 
+// w_o != null (B = 1): o_proj from x_h fused in (launch_oproj_attn_post_b1); null: o_proj already computed.
+void squid_launch_mega_attn_post_mlp_in_x(
+    const CLinearWeight* w_o, const void* x_h,
+    float* o_proj, const void* attn_sw, float* attn_ring, const float* hidden, const float* partial_prev,
+    float* blocks, int32_t block_count_before, uint8_t is_boundary, float* residual_out, const float* mlp_query,
+    const void* mlp_norm_w, float* mlp_out, void* mlp_out_h, int32_t B, const int32_t* d_pos,
+    const float* abl_r, const float* abl_d, const float* abl_p, const float* udir, void* stream) {
+    if (w_o != nullptr && B == 1) {
+        launch_oproj_attn_post_b1(
+            to_lw(*w_o), static_cast<const __half*>(x_h),
+            o_proj, static_cast<const __nv_bfloat16*>(attn_sw), attn_ring, hidden, partial_prev,
+            blocks, block_count_before, is_boundary != 0, residual_out, mlp_query,
+            static_cast<const __nv_bfloat16*>(mlp_norm_w), mlp_out, static_cast<__half*>(mlp_out_h),
+            d_pos, abl_r, abl_d, abl_p, udir, static_cast<cudaStream_t>(stream));
+        return;
+    }
+    if (w_o != nullptr) launch_linear_h(to_lw(*w_o), static_cast<const __half*>(x_h), o_proj, B, false, static_cast<cudaStream_t>(stream));
+    squid_launch_mega_attn_post_mlp_in(o_proj, attn_sw, attn_ring, hidden, partial_prev, blocks, block_count_before,
+        is_boundary, residual_out, mlp_query, mlp_norm_w, mlp_out, mlp_out_h, B, d_pos, abl_r, abl_d, abl_p, udir, stream);
+}
+
 void squid_launch_route_topk_nvfp4(
     const void* m_h, const CLinearWeight* router_nvfp4, const float* router_bias,
     float* scratch_logits, int32_t* out_ids, float* out_weights, void* groups, int32_t B, void* stream) {

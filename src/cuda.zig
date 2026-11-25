@@ -361,6 +361,31 @@ pub extern "c" fn squid_launch_mega_attn_post_mlp_in(
     stream: ?*anyopaque,
 ) void;
 
+pub extern "c" fn squid_launch_mega_attn_post_mlp_in_x(
+    w_o: ?*const CLinearWeight, // != null: o_proj computed here from x_h (B = 1 fused); null: already computed
+    x_h: ?*const anyopaque,
+    o_proj: [*]f32,
+    attn_sw: *const anyopaque,
+    attn_ring: [*]f32,
+    hidden: [*]const f32,
+    partial_prev: [*]const f32,
+    blocks: [*]f32,
+    block_count_before: i32,
+    is_boundary: u8,
+    residual_out: [*]f32,
+    mlp_query: [*]const f32,
+    mlp_norm_w: ?*const anyopaque,
+    mlp_out: [*]f32,
+    mlp_out_h: ?*anyopaque,
+    batch_size: i32,
+    d_pos: *const i32,
+    abl_r: ?[*]const f32,
+    abl_d: ?[*]const f32,
+    abl_p: ?[*]const f32,
+    udir: ?[*]const f32,
+    stream: ?*anyopaque,
+) void;
+
 pub extern "c" fn squid_launch_route_fused_b1(
     m_h: *const anyopaque,
     router_nvfp4: *const CLinearWeight,

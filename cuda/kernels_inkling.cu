@@ -2409,8 +2409,9 @@ __device__ __forceinline__ float4 apply_ablation_576(
 // MEGA-FUSION 3 (v3): 576-thread (18-warp) VECTORIZED float4 REGISTER-CACHED ZERO-SMEM-ARRAY!
 // Every thread owns 1 contiguous float4 (4 channels -> 576 * 4 = 2304 EXACT!).
 // Loads blocks[] ONCE into registers (2x fewer VRAM reads, 0 KB SMEM arrays, 4x fewer LDG/STG!).
-__global__ void __launch_bounds__(576)
-mega_attn_post_mlp_in_kernel(
+template <bool COHERENT_CUR>  // true: o_proj was written by other blocks of the calling grid (read via L2)
+__device__ __forceinline__ void mega_attn_post_mlp_in_body(
+    int b,
     const float* __restrict__ o_proj,
     const __nv_bfloat16* __restrict__ attn_sconv_w,
     float* __restrict__ attn_ring,
@@ -2429,13 +2430,10 @@ mega_attn_post_mlp_in_kernel(
     const float* __restrict__ abl_d,
     const float* __restrict__ abl_p,
     const float* __restrict__ udir) {
-    int b = blockIdx.x;
     int tid = threadIdx.x; // 0..575
     int lane = tid & 31;
     int warp = tid >> 5;   // 0..17
     int c4 = tid << 2;     // 0, 4, ..., 2300
-    pdl_wait();
-    pdl_trigger();
     int p = (*d_pos) + b;
     int n_blocks = block_count_before + (is_boundary ? 1 : 0);
     int n_cand = n_blocks + 1;
@@ -2452,8 +2450,12 @@ mega_attn_post_mlp_in_kernel(
     float4 ao;
     if (udir) {  // B = 1 only (for B > 1 the conv reads the other rows, which dir_project_kernel projects first)
         __shared__ float s_udot;
-        float4 cur = *reinterpret_cast<const float4*>(o_proj + (size_t)b * HIDDEN + c4);
+        float4 cur = COHERENT_CUR ? __ldcg(reinterpret_cast<const float4*>(o_proj + (size_t)b * HIDDEN + c4))
+                                  : *reinterpret_cast<const float4*>(o_proj + (size_t)b * HIDDEN + c4);
         cur = dir_project_f4_576(cur, udir, c4, lane, warp, sm, &s_udot);
+        ao = sconv_apply_f4_cur(cur, o_proj, attn_sconv_w, attn_ring, b, p, c4, true);
+    } else if constexpr (COHERENT_CUR) {  // B = 1: sconv_apply_f4 = load row b + sconv_apply_f4_cur (no other rows)
+        float4 cur = __ldcg(reinterpret_cast<const float4*>(o_proj + (size_t)b * HIDDEN + c4));
         ao = sconv_apply_f4_cur(cur, o_proj, attn_sconv_w, attn_ring, b, p, c4, true);
     } else {
         ao = sconv_apply_f4(o_proj, attn_sconv_w, attn_ring, b, p, c4, true);
@@ -2547,6 +2549,124 @@ mega_attn_post_mlp_in_kernel(
     } else {
         *reinterpret_cast<float4*>(mo) = v;
     }
+}
+
+__global__ void __launch_bounds__(576)
+mega_attn_post_mlp_in_kernel(
+    const float* __restrict__ o_proj,
+    const __nv_bfloat16* __restrict__ attn_sconv_w,
+    float* __restrict__ attn_ring,
+    const float* __restrict__ hidden,
+    const float* __restrict__ partial_prev,
+    float* __restrict__ blocks,
+    int block_count_before,
+    bool is_boundary,
+    float* __restrict__ residual_out,
+    const float* __restrict__ mlp_query,
+    const __nv_bfloat16* __restrict__ mlp_norm_w,
+    float* __restrict__ mlp_out,
+    __half* __restrict__ mlp_out_h,
+    const int32_t* __restrict__ d_pos,
+    const float* __restrict__ abl_r,
+    const float* __restrict__ abl_d,
+    const float* __restrict__ abl_p,
+    const float* __restrict__ udir) {
+    pdl_wait();
+    pdl_trigger();
+    mega_attn_post_mlp_in_body<false>(blockIdx.x, o_proj, attn_sconv_w, attn_ring, hidden, partial_prev, blocks, block_count_before, is_boundary, residual_out, mlp_query, mlp_norm_w, mlp_out, mlp_out_h, d_pos, abl_r, abl_d, abl_p, udir);
+}
+
+// B = 1 (SQUID_OPROJ_POST_FUSED, default on): o_proj (nvfp4, K = 3072) and mega_attn_post_mlp_in in one launch.
+// 64 blocks x 576 threads; every half-warp computes one o_proj row with the code of linear_nvfp4_b1_pdl_kernel
+// <false, 12> (36 rows per block instead of 8: same rows, same arithmetic), then the last block to finish runs
+// mega_attn_post_mlp_in's body (reading o_proj through L2). One kernel boundary fewer per visit.
+constexpr int OPP_THREADS = 576;
+constexpr int OPP_ROWS = OPP_THREADS / 16;     // 36
+constexpr int OPP_BLOCKS = HIDDEN / OPP_ROWS;  // 64
+static_assert(OPP_BLOCKS * OPP_ROWS == HIDDEN, "o_proj rows per block");
+__device__ uint32_t g_oproj_post_ctr;  // zero at module load, reset by the last block
+
+__global__ void __launch_bounds__(OPP_THREADS, 2)
+oproj_attn_post_b1_kernel(
+    const uint8_t* __restrict__ w_data,
+    const uint8_t* __restrict__ w_scales,
+    float global_scale,
+    const __half* __restrict__ x_h,
+    float* o_proj,
+    const __nv_bfloat16* __restrict__ attn_sconv_w,
+    float* __restrict__ attn_ring,
+    const float* __restrict__ hidden,
+    const float* __restrict__ partial_prev,
+    float* __restrict__ blocks,
+    int block_count_before,
+    bool is_boundary,
+    float* __restrict__ residual_out,
+    const float* __restrict__ mlp_query,
+    const __nv_bfloat16* __restrict__ mlp_norm_w,
+    float* __restrict__ mlp_out,
+    __half* __restrict__ mlp_out_h,
+    const int32_t* __restrict__ d_pos,
+    const float* __restrict__ abl_r,
+    const float* __restrict__ abl_d,
+    const float* __restrict__ abl_p,
+    const float* __restrict__ udir,
+    uint32_t zero) {
+    {
+        constexpr int ITERS = 12;
+        constexpr int K = 3072;
+        int hw = threadIdx.x >> 4;   // 0..35
+        int lane = threadIdx.x & 15; // 0..15
+        int row = blockIdx.x * OPP_ROWS + hw;
+
+        const uint2* w_row = reinterpret_cast<const uint2*>(w_data + (size_t)row * (K >> 1));
+        const uint8_t* s_row = w_scales + (size_t)row * (K >> 4);
+
+        uint2 w8[ITERS];
+        uint8_t s8[ITERS];
+        #pragma unroll
+        for (int iter = 0; iter < ITERS; ++iter) {
+            int blk = lane + iter * 16;
+            w8[iter] = ld_stream_u2(w_row + blk);
+            s8[iter] = ld_scale_u8(s_row + blk);
+        }
+        pdl_wait_fenced(zero);
+
+        float acc = 0.0f;
+        #pragma unroll
+        for (int iter = 0; iter < ITERS; ++iter) {
+            int koff = (lane + iter * 16) << 4;
+            uint4 xv0 = ld_dep_u4(x_h + koff);
+            uint4 xv1 = ld_dep_u4(x_h + koff + 8);
+            __half2 wh[8];
+            cvt_e2m1x8_to_half2x4(w8[iter].x, wh[0], wh[1], wh[2], wh[3]);
+            cvt_e2m1x8_to_half2x4(w8[iter].y, wh[4], wh[5], wh[6], wh[7]);
+            float sc = cvt_e4m3_to_float(s8[iter]);
+            const __half2* xb0 = reinterpret_cast<const __half2*>(&xv0);
+            const __half2* xb1 = reinterpret_cast<const __half2*>(&xv1);
+            __half2 p0 = __hmul2(wh[0], xb0[0]);
+            __half2 p1 = __hmul2(wh[1], xb0[1]);
+            p0 = __hfma2(wh[2], xb0[2], p0);
+            p1 = __hfma2(wh[3], xb0[3], p1);
+            p0 = __hfma2(wh[4], xb1[0], p0);
+            p1 = __hfma2(wh[5], xb1[1], p1);
+            p0 = __hfma2(wh[6], xb1[2], p0);
+            p1 = __hfma2(wh[7], xb1[3], p1);
+            float2 pf = __half22float2(__hadd2(p0, p1));
+            acc = fmaf(pf.x + pf.y, sc, acc);
+        }
+
+        float s = half_warp_sum(acc) * global_scale;
+        if (lane == 0) o_proj[row] = s;
+    }
+    __shared__ uint32_t s_last;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) s_last = (atomicAdd(&g_oproj_post_ctr, 1u) == OPP_BLOCKS - 1) ? 1u : 0u;
+    __syncthreads();
+    if (s_last == 0u) return;
+    __threadfence();
+    if (threadIdx.x == 0) g_oproj_post_ctr = 0u;
+    mega_attn_post_mlp_in_body<true>(0, o_proj, attn_sconv_w, attn_ring, hidden, partial_prev, blocks, block_count_before, is_boundary, residual_out, mlp_query, mlp_norm_w, mlp_out, mlp_out_h, d_pos, abl_r, abl_d, abl_p, udir);
 }
 
 // MEGA-FUSION 4 (v3): 576-thread vectorized float4 with optional deterministic 8-slot MoE reduction!
@@ -3358,6 +3478,26 @@ void launch_mega_attn_post_mlp_in(
     launch_pdl(mega_attn_post_mlp_in_kernel, dim3(B), 576, stream,
         o_proj, attn_sconv_w, attn_ring, hidden, partial_prev, blocks, block_count_before, is_boundary,
         residual_out, mlp_query, mlp_norm_w, mlp_out, mlp_out_h, d_pos, abl_r, abl_d, abl_p, udir);
+}
+
+void launch_oproj_attn_post_b1(
+    const LinearWeight& w_o, const __half* x_h,
+    float* o_proj, const __nv_bfloat16* attn_sconv_w, float* attn_ring,
+    const float* hidden, const float* partial_prev, float* blocks, int block_count_before, bool is_boundary,
+    float* residual_out, const float* mlp_query, const __nv_bfloat16* mlp_norm_w,
+    float* mlp_out, __half* mlp_out_h, const int32_t* d_pos,
+    const float* abl_r, const float* abl_d, const float* abl_p, const float* udir, cudaStream_t stream) {
+    if (w_o.kind != WeightKind::NVFP4 || w_o.cols != 3072 || w_o.rows != HIDDEN) {
+        launch_linear_h(w_o, x_h, o_proj, 1, false, stream);
+        launch_mega_attn_post_mlp_in(o_proj, attn_sconv_w, attn_ring, hidden, partial_prev, blocks, block_count_before,
+            is_boundary, residual_out, mlp_query, mlp_norm_w, mlp_out, mlp_out_h, 1, d_pos, abl_r, abl_d, abl_p, udir,
+            stream);
+        return;
+    }
+    oproj_attn_post_b1_kernel<<<OPP_BLOCKS, OPP_THREADS, 0, stream>>>(
+        static_cast<const uint8_t*>(w_o.data), w_o.scales, w_o.global_scale, x_h,
+        o_proj, attn_sconv_w, attn_ring, hidden, partial_prev, blocks, block_count_before, is_boundary,
+        residual_out, mlp_query, mlp_norm_w, mlp_out, mlp_out_h, d_pos, abl_r, abl_d, abl_p, udir, 0u);
 }
 
 void launch_mega_mlp_post_res(
