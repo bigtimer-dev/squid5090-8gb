@@ -1105,6 +1105,10 @@ void squid_prefill_tiles_set_host_banks(int32_t banks_host) {
     prefill_tiles_set_host_banks(banks_host);
 }
 
+uint64_t squid_prefill_stage_init(void) {
+    return (uint64_t)prefill_stage_init();
+}
+
 void squid_launch_prefill_route_and_sort(
     const float* router_logits, const float* router_bias, int32_t* route_ids, float* route_w,
     int32_t* expert_offsets, int32_t* sorted_tok, int32_t* sorted_slot, float* sorted_w,

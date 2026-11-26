@@ -697,6 +697,9 @@ pub const Engine = struct {
         self.init_decode_cache();
         self.init_route_trace();
         self.init_score();
+        // Prefill expert stage (cuda/kernels_prefill.cu): VRAM slots the copy engine fills with host-bank experts.
+        const stage_b: u64 = cuda.squid_prefill_stage_init();
+        if (stage_b > 0) tiger.print_stdout("[stage] prefill expert GEMMs copy host-RAM experts through {d:.0} MiB of VRAM\n", .{@as(f64, @floatFromInt(stage_b)) / 1048576.0});
     }
 
     fn init_decode_bank(self: *Engine) void {

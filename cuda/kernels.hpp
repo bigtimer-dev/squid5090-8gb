@@ -638,6 +638,7 @@ void launch_prefill_controller_one(
 
 // Picks the prefill token-tile default from the expert placement (see kernels_prefill.cu); call after loading.
 void prefill_tiles_set_host_banks(int banks_host);
+size_t prefill_stage_init();
 
 void launch_prefill_route_and_sort(
     const float* router_logits,
