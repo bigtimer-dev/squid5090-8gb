@@ -456,8 +456,11 @@ pub extern "c" fn squid_launch_moe_down_h(
 pub extern "c" fn squid_launch_cpu_moe_post(x_h: *const anyopaque, ids: [*]const i32, wts: [*]const f32, shared_dev: *anyopaque, seq_ctr: [*]u32, layer: i32, slot_begin: i32, k_split: i32, stream: ?*anyopaque) void;
 pub extern "c" fn squid_launch_l2_prefetch_if(ptrs: [*]const ?*const anyopaque, bytes: [*]const u32, n: i32, mode: i32, gate: ?[*]const i32, stream: ?*anyopaque) void;
 pub extern "c" fn squid_launch_l2_prefetch(ptrs: [*]const ?*const anyopaque, bytes: [*]const u32, n: i32, mode: i32, stream: ?*anyopaque) void;
+pub extern "c" fn squid_launch_cpu_moe_post_cache_multi(x_h: *const anyopaque, ids: [*]const i32, wts: [*]const f32, shared_dev: *anyopaque, seq_ctr: [*]u32, layer: i32, cmap_l: [*]const i32, glist: [*]i32, hist_l: ?[*]u32, pcie_h: i32, n: i32, stream: ?*anyopaque) void;
+pub extern "c" fn squid_launch_cpu_moe_wait_add_multi(shared_dev: *anyopaque, seq_ctr: [*]const u32, out: [*]f32, err: [*]i32, glist: [*]const i32, n: i32, stream: ?*anyopaque) void;
 pub extern "c" fn squid_launch_cpu_moe_wait_add(shared_dev: *anyopaque, seq_ctr: [*]const u32, out: [*]f32, err: [*]i32, stream: ?*anyopaque) void;
 pub extern "c" fn squid_launch_moe_slots_list_h(w13: *const CExpertBank, w2: *const CExpertBank, w13b: *const CExpertBank, w2b: *const CExpertBank, w13h: *const CExpertBank, w2h: *const CExpertBank, x_h: *const anyopaque, route_w: [*]const f32, act_h: *anyopaque, out_down: [*]f32, glist: [*]const i32, stream: ?*anyopaque) void;
+pub extern "c" fn squid_launch_moe_slots_multi_h(w13: *const CExpertBank, w2: *const CExpertBank, w13b: *const CExpertBank, w2b: *const CExpertBank, w13h: *const CExpertBank, w2h: *const CExpertBank, x_h: *const anyopaque, route_w: [*]const f32, act_h: *anyopaque, out_down: [*]f32, gcode: [*]const i32, n: i32, stream: ?*anyopaque) void;
 pub extern "c" fn squid_launch_cpu_moe_post_cache(x_h: *const anyopaque, ids: [*]const i32, wts: [*]const f32, shared_dev: *anyopaque, seq_ctr: [*]u32, layer: i32, cmap_l: [*]const i32, glist: [*]i32, hist_l: ?[*]u32, pcie_h: i32, stream: ?*anyopaque) void;
 pub extern "c" fn squid_launch_cpu_moe_wait_add_if(shared_dev: *anyopaque, seq_ctr: [*]const u32, out: [*]f32, err: [*]i32, posted: [*]const i32, stream: ?*anyopaque) void;
 pub extern "c" fn squid_set_moe_tail_slots(w13: [*]const ?*const anyopaque, w13s: [*]const ?*const anyopaque, w2: [*]const ?*const anyopaque, w2s: [*]const ?*const anyopaque, n: i32, wf_off: i32) i32;
@@ -788,6 +791,12 @@ pub extern "c" fn squid_launch_prefill_controller_one(
     batch_size: i32,
     stream: ?*anyopaque,
 ) void;
+
+/// Prefill token-tile default by expert placement: 128-row tiles at every chunk size when any bank is on the host.
+pub extern "c" fn squid_prefill_tiles_set_host_banks(banks_host: i32) void;
+pub extern "c" fn squid_prefill_stage_init() u64;
+pub extern "c" fn squid_prefill_stage_borrow(ptrs: [*]const u64, sizes: [*]const u64, n: i32, b: i32, stream: ?*anyopaque) i32;
+pub extern "c" fn squid_prefill_stage_return() void;
 
 pub extern "c" fn squid_launch_prefill_route_and_sort(
     router_logits: [*]const f32,

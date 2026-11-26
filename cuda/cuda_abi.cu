@@ -804,6 +804,15 @@ void squid_launch_moe_slots_list_h(
                             static_cast<__half*>(act_h), out_down, glist, static_cast<cudaStream_t>(stream));
 }
 
+void squid_launch_moe_slots_multi_h(
+    const CExpertBank* w13, const CExpertBank* w2, const CExpertBank* w13b, const CExpertBank* w2b,
+    const CExpertBank* w13h, const CExpertBank* w2h, const void* x_h, const float* route_w, void* act_h,
+    float* out_down, const int32_t* gcode, int32_t n, void* stream) {
+    launch_moe_slots_multi_h(to_eb(*w13), to_eb(*w2), to_eb(*w13b), to_eb(*w2b), to_eb(*w13h), to_eb(*w2h),
+                             static_cast<const __half*>(x_h), route_w, static_cast<__half*>(act_h), out_down, gcode, n,
+                             static_cast<cudaStream_t>(stream));
+}
+
 void squid_launch_mega_mlp_post_res(
     const float* moe_down_or_slots, uint8_t moe_is_slotted, const void* mlp_sw, float* mlp_ring,
     const float* residual, float* hidden_out, int32_t B, const int32_t* d_pos,
@@ -1090,6 +1099,19 @@ void squid_launch_prefill_controller_one(
         scratch_msg, static_cast<__half*>(scratch_cat_h), scratch_d, static_cast<__half*>(scratch_d_h),
         scratch_f, scratch_g, static_cast<__half*>(w_f16_scratch),
         B, static_cast<cudaStream_t>(stream));
+}
+
+void squid_prefill_tiles_set_host_banks(int32_t banks_host) {
+    prefill_tiles_set_host_banks(banks_host);
+}
+
+int32_t squid_prefill_stage_borrow(const uint64_t* ptrs, const uint64_t* sizes, int32_t n, int32_t b, void* stream) {
+    return prefill_stage_borrow(ptrs, sizes, n, b, static_cast<cudaStream_t>(stream));
+}
+void squid_prefill_stage_return(void) { prefill_stage_return(); }
+
+uint64_t squid_prefill_stage_init(void) {
+    return (uint64_t)prefill_stage_init();
 }
 
 void squid_launch_prefill_route_and_sort(

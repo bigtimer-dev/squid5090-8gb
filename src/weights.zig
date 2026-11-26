@@ -508,6 +508,7 @@ pub const ModelWeights = struct {
                 "[weights] Experts: {d}/48 banks in VRAM, {d} in pinned host RAM ({d:.2} GiB, zero-copy) | host bank-visits/token={d}/96 | Uncensor={s}\n",
                 .{ 48 - banks_host, banks_host, @as(f64, @floatFromInt(self.host_expert_capacity)) / (1024.0 * 1024.0 * 1024.0), host_visits, if (has_uncensor) "on" else "off" },
             );
+            cuda.squid_prefill_tiles_set_host_banks(@intCast(banks_host));
         }
 
         const elapsed_sec: f64 = @as(f64, @floatFromInt(tiger.clock_monotonic_ns() - start_ns)) / 1_000_000_000.0;

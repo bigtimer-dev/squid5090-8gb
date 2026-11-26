@@ -9,6 +9,7 @@
 #include "weights.hpp"
 
 #include <cublas_v2.h>
+#include <cstdlib>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -600,7 +601,8 @@ p_wgemm_kernel(
     const int32_t* __restrict__ sorted_slot,
     const float* __restrict__ sorted_w,
     __half* __restrict__ out_act_h,
-    float* __restrict__ out_slots) {
+    float* __restrict__ out_slots,
+    int e_lo, int e_hi) {
     constexpr int KS = K / WG_BK;
     constexpr int NE = (MODE == WgemmMode::Up) ? (2 * INTERMEDIATE) : HIDDEN;
     constexpr int NTILES_N = NE / WG_TN;
@@ -614,17 +616,33 @@ p_wgemm_kernel(
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
-    const int tile_idx = blockIdx.x / NTILES_N;
-    if (tile_idx >= expert_offsets[129]) return;
+    // Fork: e_hi > 0 runs only the tiles of experts [e_lo, e_hi), whose weights were copied to a VRAM stage
+    // (w_codes / w_scales start at expert e_lo's); a grid of one CTA per SM walks them. Otherwise one CTA per
+    // (tile, N tile) as upstream. The tile list is expert-major, so a group's tiles are one range of it.
+    const int nt_all = expert_offsets[129];
+    int w_first = 0, w_end = nt_all * NTILES_N;
+    if (e_hi > 0) {
+        const int32_t* tile_exp = expert_offsets + 130;
+        int lo = 0, hi = nt_all;
+        while (lo < hi) { const int m = (lo + hi) >> 1; if (tile_exp[m] < e_lo) lo = m + 1; else hi = m; }
+        w_first = lo * NTILES_N;
+        hi = nt_all;
+        while (lo < hi) { const int m = (lo + hi) >> 1; if (tile_exp[m] < e_hi) lo = m + 1; else hi = m; }
+        w_end = lo * NTILES_N;
+    }
+    #pragma unroll 1
+    for (int wi = w_first + blockIdx.x; wi < w_end; wi += gridDim.x) {
+    __syncthreads(); // the previous tile's last shared-memory reads are done before this tile's loads land
+    const int tile_idx = wi / NTILES_N;
 
     const int e  = expert_offsets[130 + tile_idx];
     const int pb = expert_offsets[386 + tile_idx];
     const int en = expert_offsets[642 + tile_idx];
     const int n  = en - pb;
-    const int n0 = (blockIdx.x % NTILES_N) * WG_TN;
+    const int n0 = (wi % NTILES_N) * WG_TN;
 
-    const uint8_t* code_tile  = w_codes  + ((size_t)e * NE + n0) * C::CODE_ROW;
-    const uint8_t* scale_tile = w_scales + ((size_t)e * NE + n0) * C::SCALE_ROW;
+    const uint8_t* code_tile  = w_codes  + ((size_t)(e - e_lo) * NE + n0) * C::CODE_ROW;
+    const uint8_t* scale_tile = w_scales + ((size_t)(e - e_lo) * NE + n0) * C::SCALE_ROW;
     const uint16_t* a_base    = reinterpret_cast<const uint16_t*>(x_h);
 
     const uint16_t* arow[TM / 32];
@@ -804,24 +822,93 @@ p_wgemm_kernel(
             }
         }
     }
+    } // tiles
+}
+
+// Fork: prefill expert stage. Read straight from host RAM, a bank's weights cross PCIe once per token tile (the L2
+// does not keep zero-copy reads), and in 64-byte pieces: a 2048-token chunk's host-bank GEMMs ran at ~5 GB/s of
+// weights against 13.3 GB/s for a DMA. With a stage, the copy engine moves G experts at a time into one of two VRAM
+// slots on its own stream, and the GEMM of each group reads them from there while the next group copies. Same
+// tiles, same arithmetic, so the output is bit-identical. SQUID_PREFILL_STAGE_MB = VRAM for the two slots (128;
+// less if fewer than 192 MiB would stay free; 0 = off: read host RAM directly); SQUID_PREFILL_STAGE_MIN_B =
+// smallest chunk that uses it (0: on a 4060 Laptop it was faster from the smallest batched chunk up). During a
+// prefill the engine can lend it more slots (prefill_stage_borrow); the ring then holds slots of different sizes, each
+// group as many experts as its slot fits.
+constexpr int PREFILL_STAGE_SLOTS = 2;                     // its own slots
+constexpr int PREFILL_STAGE_MAX = PREFILL_STAGE_SLOTS + 64; // + VRAM borrowed for one prefill (prefill_stage_borrow)
+struct PrefillStage {
+    uint8_t* slot[PREFILL_STAGE_MAX] = {};
+    size_t sz[PREFILL_STAGE_MAX] = {};
+    int n = 0;              // slots in the ring: its own, then the borrowed ones
+    size_t slot_bytes = 0;  // size of its own slots (0: stage off)
+    cudaStream_t copy = nullptr;
+    cudaEvent_t ready[PREFILL_STAGE_MAX] = {}, freed[PREFILL_STAGE_MAX] = {}, borrowed = nullptr;
+    unsigned seq = 0;
+    int sms = 0, min_b = 0;
+};
+constexpr size_t PREFILL_STAGE_NEED = (size_t)2304 * (1152 + 144) + 256; // one NVFP4 w13 expert
+static PrefillStage g_stage;
+static int g_prefill_banks_host = -1;
+
+static bool prefill_bank_on_host(const void* p) {
+    cudaPointerAttributes a{};
+    if (cudaPointerGetAttributes(&a, p) != cudaSuccess) { (void)cudaGetLastError(); return false; }
+    return a.type == cudaMemoryTypeHost;
 }
 
 template <int FMT, WgemmMode MODE, int K, int TM>
 static void dispatch_wgemm_tm(
     const ExpertBank& eb, const __half* x_h,
     const int32_t* expert_offsets, const int32_t* sorted_tok, const int32_t* sorted_slot, const float* sorted_w,
-    __half* out_act_h, float* out_slots, cudaStream_t stream) {
+    __half* out_act_h, float* out_slots, int B, cudaStream_t stream) {
     constexpr int NE = (MODE == WgemmMode::Up) ? (2 * INTERMEDIATE) : HIDDEN;
     constexpr int NTILES_N = NE / WG_TN;
-    constexpr int SMEM = WgCfg<FMT, K, TM>::SMEM;
+    using C = WgCfg<FMT, K, TM>;
+    constexpr int SMEM = C::SMEM;
     static const cudaError_t attr = cudaFuncSetAttribute(
         p_wgemm_kernel<FMT, MODE, K, TM>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
     (void)attr;
+    const float* factors = (FMT == 0) ? eb.expert_scale : nullptr;
+    PrefillStage& st = g_stage;
+    const size_t pc = (size_t)NE * C::CODE_ROW, ps = (size_t)NE * C::SCALE_ROW;
+    const size_t pe = pc + ps;
+    const int G = (st.slot_bytes > 256) ? (int)((st.slot_bytes - 256) / pe) : 0; // its own slots hold >= 1
+    if (G >= 1 && B >= st.min_b && prefill_bank_on_host(eb.data)) {
+        for (int e_lo = 0; e_lo < NUM_EXPERTS;) {
+            const unsigned k = st.seq++ % (unsigned)st.n;
+            const int gk = (int)((st.sz[k] - 256) / pe); // >= 1: borrowed slots are at least PREFILL_STAGE_NEED
+            const int e_hi = (e_lo + gk < NUM_EXPERTS) ? e_lo + gk : NUM_EXPERTS;
+            const size_t ne = (size_t)(e_hi - e_lo);
+            const uint8_t* gc = eb.data + e_lo * pc;   // the group in host RAM, read directly if a copy fails
+            const uint8_t* gs = eb.scales + e_lo * ps;
+            uint8_t* dc = st.slot[k];
+            uint8_t* ds = dc + ((ne * pc + 255) & ~(size_t)255);
+            if (st.slot_bytes > 0) {
+                const bool ok = cudaStreamWaitEvent(st.copy, st.freed[k], 0) == cudaSuccess && // the slot's last GEMM is done
+                                cudaMemcpyAsync(dc, gc, ne * pc, cudaMemcpyDefault, st.copy) == cudaSuccess &&
+                                cudaMemcpyAsync(ds, gs, ne * ps, cudaMemcpyDefault, st.copy) == cudaSuccess &&
+                                cudaEventRecord(st.ready[k], st.copy) == cudaSuccess &&
+                                cudaStreamWaitEvent(stream, st.ready[k], 0) == cudaSuccess;
+                if (ok) {
+                    gc = dc;
+                    gs = ds;
+                } else {
+                    fprintf(stderr, "[stage] copy failed (%s); expert GEMMs read host RAM directly from now on\n",
+                            cudaGetErrorString(cudaGetLastError()));
+                    st.slot_bytes = 0;
+                }
+            }
+            p_wgemm_kernel<FMT, MODE, K, TM><<<st.sms, WG_NT, SMEM, stream>>>(
+                gc, gs, factors, x_h, expert_offsets, sorted_tok, sorted_slot, sorted_w, out_act_h, out_slots, e_lo, e_hi);
+            if (gc == dc) cudaEventRecord(st.freed[k], stream);
+            e_lo = e_hi;
+        }
+        return;
+    }
     // Max 256 active tiles by pigeonhole bound (B<=512 w/ TR=32 or B<=2048 w/ TR=128)
     int grid = 256 * NTILES_N;
     p_wgemm_kernel<FMT, MODE, K, TM><<<grid, WG_NT, SMEM, stream>>>(
-        eb.data, eb.scales, (FMT == 0) ? eb.expert_scale : nullptr,
-        x_h, expert_offsets, sorted_tok, sorted_slot, sorted_w, out_act_h, out_slots);
+        eb.data, eb.scales, factors, x_h, expert_offsets, sorted_tok, sorted_slot, sorted_w, out_act_h, out_slots, 0, 0);
 }
 
 // 1-launch batched B<=2048 global dynamic short conv for BOTH K (blockIdx.y=0) and V (blockIdx.y=1) in-place!
@@ -1448,12 +1535,105 @@ void launch_prefill_controller_one(
     p_ctrl_finish_kernel<<<B, 256, 0, stream>>>(x, scratch_msg, scratch_f, scratch_g, post_norm, out, out_h);
 }
 
+// Token-tile rows of the prefill expert GEMMs (and of the tile list the sort builds for them): 32 for chunks of
+// up to SQUID_PREFILL_TM32_MAX tokens, else 128. Every tile reads its expert's weights once, so smaller tiles
+// re-read more of them. Over PCIe, for host-resident banks, that cost 9-32% of the prefill time of 130-500-token
+// prompts on the RTX 4060 Laptop, and 128 was never slower; so with any bank on the host the default is 0 (always
+// 128), else upstream's 512. Bit-identical either way.
+static int g_prefill_tm32_max = -1;
+
+static int prefill_tm32_max_or(int fallback) {
+    const char* v = getenv("SQUID_PREFILL_TM32_MAX");
+    const int n = v ? atoi(v) : fallback;
+    return n < 512 ? n : 512; // the grids cover 256 tiles: B <= 512 with 32 rows, B <= 2048 with 128
+}
+
+void prefill_tiles_set_host_banks(int banks_host) {
+    g_prefill_banks_host = banks_host;
+    g_prefill_tm32_max = prefill_tm32_max_or(banks_host > 0 ? 0 : 512);
+}
+
+// Allocates the stage (after the engine's VRAM is placed, so it takes what is left), if any bank is in host RAM.
+// Returns the bytes allocated.
+size_t prefill_stage_init() {
+    if (g_stage.slot_bytes > 0 || g_prefill_banks_host <= 0) return 0;
+    const char* v = getenv("SQUID_PREFILL_STAGE_MB");
+    size_t want = (size_t)(v ? atoi(v) : 128) << 20;
+    if (want == 0) return 0;
+    const char* mb = getenv("SQUID_PREFILL_STAGE_MIN_B");
+    g_stage.min_b = mb ? atoi(mb) : 0;
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return 0;
+    const size_t keep = (size_t)192 << 20; // what stays free for the CUDA graphs, cuBLAS and the driver
+    if (free_b < keep + want) want = (free_b > keep) ? free_b - keep : 0;
+    const size_t slot = (want / PREFILL_STAGE_SLOTS) & ~(size_t)255;
+    if (slot < PREFILL_STAGE_NEED) return 0; // banks a slot can't hold (one NVFP4 w13 expert) read directly
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&g_stage.sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) return 0;
+    if (cudaStreamCreateWithFlags(&g_stage.copy, cudaStreamNonBlocking) != cudaSuccess) return 0;
+    for (int k = 0; k < PREFILL_STAGE_SLOTS; ++k) {
+        if (cudaMalloc(&g_stage.slot[k], slot) != cudaSuccess ||
+            cudaEventCreateWithFlags(&g_stage.ready[k], cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&g_stage.freed[k], cudaEventDisableTiming) != cudaSuccess) {
+            (void)cudaGetLastError();
+            for (int j = 0; j <= k; ++j) if (g_stage.slot[j]) { cudaFree(g_stage.slot[j]); g_stage.slot[j] = nullptr; }
+            return 0;
+        }
+    }
+    for (int k = PREFILL_STAGE_SLOTS; k < PREFILL_STAGE_MAX; ++k)
+        if (cudaEventCreateWithFlags(&g_stage.ready[k], cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&g_stage.freed[k], cudaEventDisableTiming) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+    if (cudaEventCreateWithFlags(&g_stage.borrowed, cudaEventDisableTiming) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+    for (int k = 0; k < PREFILL_STAGE_SLOTS; ++k) g_stage.sz[k] = slot;
+    g_stage.n = PREFILL_STAGE_SLOTS;
+    g_stage.slot_bytes = slot;
+    return slot * PREFILL_STAGE_SLOTS;
+}
+
+// Lends the stage more VRAM for one prefill: regions [ptr, ptr + size), cut into slots no bigger than its own, that
+// the caller doesn't touch until prefill_stage_return (the engine lends the decode cache's KV-tail slots and re-uploads
+// them afterwards). Copies into them are queued after everything already on `stream`. With more slots the copy engine
+// runs further ahead: through attention and the VRAM-bank layers it fetches the next host layers' experts. Returns the
+// slots taken (0 for a batch below the stage's minimum, which reads host RAM directly).
+int prefill_stage_borrow(const uint64_t* ptrs, const uint64_t* sizes, int n, int b, cudaStream_t stream) {
+    if (g_stage.slot_bytes == 0 || b < g_stage.min_b) return 0;
+    int m = 0;
+    for (int i = 0; i < n; ++i) {
+        uint64_t a = (ptrs[i] + 255) & ~(uint64_t)255;
+        const uint64_t end = (ptrs[i] + sizes[i]) & ~(uint64_t)255;
+        while (end > a && end - a >= PREFILL_STAGE_NEED && PREFILL_STAGE_SLOTS + m < PREFILL_STAGE_MAX) {
+            uint64_t sz = end - a;
+            if (sz > g_stage.slot_bytes) sz = (sz - g_stage.slot_bytes >= PREFILL_STAGE_NEED) ? g_stage.slot_bytes : sz;
+            g_stage.slot[PREFILL_STAGE_SLOTS + m] = reinterpret_cast<uint8_t*>(a);
+            g_stage.sz[PREFILL_STAGE_SLOTS + m] = sz;
+            a += sz;
+            ++m;
+        }
+    }
+    if (m == 0) return 0;
+    if (cudaEventRecord(g_stage.borrowed, stream) != cudaSuccess ||
+        cudaStreamWaitEvent(g_stage.copy, g_stage.borrowed, 0) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+    g_stage.n = PREFILL_STAGE_SLOTS + m;
+    return m;
+}
+
+// Ends the loan: later groups use only the stage's own slots. Work already queued on the stream still reads the
+// borrowed regions, so the caller orders its next writes to them on that stream.
+void prefill_stage_return() {
+    g_stage.n = PREFILL_STAGE_SLOTS;
+}
+
+static int prefill_tile_rows(int B) {
+    if (g_prefill_tm32_max < 0) g_prefill_tm32_max = prefill_tm32_max_or(512);
+    return (B <= g_prefill_tm32_max) ? 32 : 128;
+}
+
 void launch_prefill_route_and_sort(
     const float* router_logits, const float* router_bias,
     int32_t* route_ids, float* route_w,
     int32_t* expert_offsets, int32_t* sorted_tok, int32_t* sorted_slot, float* sorted_w,
     int B, cudaStream_t stream) {
-    int TR = (B <= 512) ? 32 : 128;
+    int TR = prefill_tile_rows(B);
     p_route_topk_only_kernel<<<B, 32, 0, stream>>>(router_logits, router_bias, route_ids, route_w);
     p_sort_experts_kernel<<<1, NUM_EXPERTS, 0, stream>>>(
         route_ids, route_w, B, TR, expert_offsets, sorted_tok, sorted_slot, sorted_w);
@@ -1464,11 +1644,11 @@ void launch_prefill_moe_gate_up_h(
     const int32_t* expert_offsets, const int32_t* sorted_tok, const int32_t* sorted_slot,
     __half* out_act_h, int B, cudaStream_t stream) {
     if (w13.is_nvfp4) {
-        if (B <= 512) dispatch_wgemm_tm<0, WgemmMode::Up, HIDDEN, 32>(w13, x_h, expert_offsets, sorted_tok, sorted_slot, nullptr, out_act_h, nullptr, stream);
-        else          dispatch_wgemm_tm<0, WgemmMode::Up, HIDDEN, 128>(w13, x_h, expert_offsets, sorted_tok, sorted_slot, nullptr, out_act_h, nullptr, stream);
+        if (prefill_tile_rows(B) == 32) dispatch_wgemm_tm<0, WgemmMode::Up, HIDDEN, 32>(w13, x_h, expert_offsets, sorted_tok, sorted_slot, nullptr, out_act_h, nullptr, B, stream);
+        else          dispatch_wgemm_tm<0, WgemmMode::Up, HIDDEN, 128>(w13, x_h, expert_offsets, sorted_tok, sorted_slot, nullptr, out_act_h, nullptr, B, stream);
     } else {
-        if (B <= 512) dispatch_wgemm_tm<1, WgemmMode::Up, HIDDEN, 32>(w13, x_h, expert_offsets, sorted_tok, sorted_slot, nullptr, out_act_h, nullptr, stream);
-        else          dispatch_wgemm_tm<1, WgemmMode::Up, HIDDEN, 128>(w13, x_h, expert_offsets, sorted_tok, sorted_slot, nullptr, out_act_h, nullptr, stream);
+        if (prefill_tile_rows(B) == 32) dispatch_wgemm_tm<1, WgemmMode::Up, HIDDEN, 32>(w13, x_h, expert_offsets, sorted_tok, sorted_slot, nullptr, out_act_h, nullptr, B, stream);
+        else          dispatch_wgemm_tm<1, WgemmMode::Up, HIDDEN, 128>(w13, x_h, expert_offsets, sorted_tok, sorted_slot, nullptr, out_act_h, nullptr, B, stream);
     }
 }
 
@@ -1477,11 +1657,11 @@ void launch_prefill_moe_down_h(
     const int32_t* expert_offsets, const int32_t* sorted_tok, const int32_t* sorted_slot,
     const float* sorted_w, float* out_slots, int B, cudaStream_t stream) {
     if (w2.is_nvfp4) {
-        if (B <= 512) dispatch_wgemm_tm<0, WgemmMode::Down, INTERMEDIATE, 32>(w2, act_h, expert_offsets, sorted_tok, sorted_slot, sorted_w, nullptr, out_slots, stream);
-        else          dispatch_wgemm_tm<0, WgemmMode::Down, INTERMEDIATE, 128>(w2, act_h, expert_offsets, sorted_tok, sorted_slot, sorted_w, nullptr, out_slots, stream);
+        if (prefill_tile_rows(B) == 32) dispatch_wgemm_tm<0, WgemmMode::Down, INTERMEDIATE, 32>(w2, act_h, expert_offsets, sorted_tok, sorted_slot, sorted_w, nullptr, out_slots, B, stream);
+        else          dispatch_wgemm_tm<0, WgemmMode::Down, INTERMEDIATE, 128>(w2, act_h, expert_offsets, sorted_tok, sorted_slot, sorted_w, nullptr, out_slots, B, stream);
     } else {
-        if (B <= 512) dispatch_wgemm_tm<1, WgemmMode::Down, INTERMEDIATE, 32>(w2, act_h, expert_offsets, sorted_tok, sorted_slot, sorted_w, nullptr, out_slots, stream);
-        else          dispatch_wgemm_tm<1, WgemmMode::Down, INTERMEDIATE, 128>(w2, act_h, expert_offsets, sorted_tok, sorted_slot, sorted_w, nullptr, out_slots, stream);
+        if (prefill_tile_rows(B) == 32) dispatch_wgemm_tm<1, WgemmMode::Down, INTERMEDIATE, 32>(w2, act_h, expert_offsets, sorted_tok, sorted_slot, sorted_w, nullptr, out_slots, B, stream);
+        else          dispatch_wgemm_tm<1, WgemmMode::Down, INTERMEDIATE, 128>(w2, act_h, expert_offsets, sorted_tok, sorted_slot, sorted_w, nullptr, out_slots, B, stream);
     }
 }
 
