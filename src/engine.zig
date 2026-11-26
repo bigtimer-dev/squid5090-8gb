@@ -239,6 +239,12 @@ pub const Engine = struct {
     dcache_tail_ptr: []usize = &.{},
     dcache_tail_on: u32 = 0,
     dcache_tail_margin: u32 = 0,
+    dcache_tail_pe: u64 = 0, // bytes per tail slot
+    // SQUID_PREFILL_STAGE_LEND (default 1): a batched prefill lends the usable tail slots [0, tail_on) to the prefill
+    // expert stage as more copy slots (they lie past every KV position the request reaches, + margin).
+    // stage_lend_end takes them back before anything else writes them; the decode cache then re-uploads them.
+    stage_lend_on: bool = true,
+    stage_lent: u32 = 0,
     dcache_tail_evicts: u64 = 0,
     dcache_tail_check: bool = false,
     // SQUID_DECODE_CACHE_DEMOTE=k: the k coldest experts (by the prior) of the VRAM-resident layers are computed by the
@@ -700,6 +706,9 @@ pub const Engine = struct {
         // Prefill expert stage (cuda/kernels_prefill.cu): VRAM slots the copy engine fills with host-bank experts.
         const stage_b: u64 = cuda.squid_prefill_stage_init();
         if (stage_b > 0) tiger.print_stdout("[stage] prefill expert GEMMs copy host-RAM experts through {d:.0} MiB of VRAM\n", .{@as(f64, @floatFromInt(stage_b)) / 1048576.0});
+        if (tiger.getenv("SQUID_PREFILL_STAGE_LEND")) |v| self.stage_lend_on = v[0] != '0';
+        if (stage_b > 0 and self.stage_lend_on and self.dcache_tail_pos.len > 0)
+            tiger.print_stdout("[stage] prefill also borrows the decode cache's usable KV-tail slots (up to {d:.0} MiB)\n", .{@as(f64, @floatFromInt(self.dcache_tail_pe * self.dcache_tail_pos.len)) / 1048576.0});
     }
 
     fn init_decode_bank(self: *Engine) void {
@@ -1092,6 +1101,7 @@ pub const Engine = struct {
     }
 
     fn ensure_decode_cache(self: *Engine) void {
+        self.stage_lend_end();
         if (self.dcache_n == 0 or self.dcache_valid) return;
         self.dcache_fill_join(); // (none in flight in practice: restores and prefills follow a join)
         const w = self.weights.?;
@@ -1311,6 +1321,7 @@ pub const Engine = struct {
     /// `hi`: KV positions [0, hi) may hold live KV or be written before decode (prompt, cached session): tail slots
     /// that reach below hi + margin are switched off, the others usable again.
     fn reset_decode_cache_session(self: *Engine, hi: u32) void {
+        self.stage_lend_end();
         if (self.dcache_n == 0) return;
         self.dcache_tail_guard(hi);
         const on = self.dcache_tail_count(hi);
@@ -1425,6 +1436,7 @@ pub const Engine = struct {
         // Prefill chunks end at the prompt end (prefill_range / prefill_final_range clip them); B <= 8 forward passes and
         // decode steps write and read at most a block past the current position.
         self.dcache_tail_margin = 64;
+        self.dcache_tail_pe = per_expert;
         return nt;
     }
 
@@ -1603,6 +1615,41 @@ pub const Engine = struct {
         tiger.print_stdout("[dcache] hole check after restore {d}: {d} of {d} holes intact\n", .{ self.dcache_hole_restores, self.dcache_nh - bad, self.dcache_nh });
     }
 
+    /// Batched prefill: lend the usable tail slots [0, tail_on) to the prefill expert stage (merged into contiguous
+    /// regions). The request's reset_decode_cache_session switched off every slot below its prompt (+ margin); copies
+    /// into the lent regions are queued after everything already on the stream (decode passes that read them).
+    fn stage_lend(self: *Engine, chunk_len: u32) void {
+        if (!self.stage_lend_on or self.stage_lent > 0 or self.dcache_tail_on == 0) return;
+        self.dcache_fill_join(); // no lazy upload may still be writing them
+        const n: usize = self.dcache_tail_on;
+        var p: [256]u64 = undefined;
+        for (0..n) |t| p[t] = self.dcache_tail_ptr[t];
+        std.sort.pdq(u64, p[0..n], {}, std.sort.asc(u64));
+        var ptrs: [256]u64 = undefined;
+        var sizes: [256]u64 = undefined;
+        var m: usize = 0;
+        for (p[0..n]) |a| {
+            if (m > 0 and ptrs[m - 1] + sizes[m - 1] == a) {
+                sizes[m - 1] += self.dcache_tail_pe;
+            } else {
+                ptrs[m] = a;
+                sizes[m] = self.dcache_tail_pe;
+                m += 1;
+            }
+        }
+        if (cuda.squid_prefill_stage_borrow(&ptrs, &sizes, @intCast(m), @intCast(chunk_len), self.stream) > 0) self.stage_lent = self.dcache_tail_on;
+    }
+
+    /// Take the lent tail slots back (before anything else writes or reads them). Stage copies into them are already
+    /// ordered before every later op on the stream (each is followed there by the GEMM that reads it).
+    fn stage_lend_end(self: *Engine) void {
+        if (self.stage_lent == 0) return;
+        cuda.squid_prefill_stage_return();
+        for (0..self.stage_lent) |t| self.dcache_loaded[self.dcache_tb + t - self.dcache_na] = 0xffff;
+        self.stage_lent = 0;
+        self.dcache_valid = false;
+    }
+
     /// Tail slots usable when KV positions [0, hi) may be live or written.
     fn dcache_tail_count(self: *const Engine, hi: u32) u32 {
         const lim: u64 = @as(u64, hi) + self.dcache_tail_margin;
@@ -1615,6 +1662,7 @@ pub const Engine = struct {
     /// experts go back to the CPU and the slot memory is zeroed (a stray read past the context end sees zeros, as
     /// before). Queued on the stream ahead of the next forward pass.
     fn dcache_tail_guard(self: *Engine, hi: u32) void {
+        self.stage_lend_end();
         const on = self.dcache_tail_count(hi);
         if (on >= self.dcache_tail_on) return;
         self.dcache_fill_join();
@@ -1661,6 +1709,7 @@ pub const Engine = struct {
 
     /// SQUID_DECODE_CACHE_TAIL_CHECK=1: compare every live tail slot with its expert's host copy (slow; for testing).
     fn dcache_tail_verify(self: *Engine) void {
+        tiger.assert(self.stage_lent == 0);
         if (self.dcache_tail_pos.len == 0) return;
         const w = self.weights.?;
         tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
@@ -3076,6 +3125,8 @@ pub const Engine = struct {
         self.dbank_valid = false; // the prefill buffers hold the decode bank / cache between prefills
         self.dcache_holes_restore();
         self.dcache_valid = false;
+        self.stage_lend(chunk_len);
+        if (self.stage_lent > 0) tiger.assert(@as(u64, start_i) + chunk_len + self.dcache_tail_margin <= self.dcache_tail_pos[self.stage_lent - 1]);
         const w = self.weights.?;
         const b_i32: i32 = @intCast(chunk_len);
         const b_usize: usize = chunk_len;
@@ -3634,6 +3685,7 @@ pub const Engine = struct {
         if (sim_pos > max_allowed) sim_pos = tiger.max_i32(0, max_allowed);
 
         self.reset();
+        self.stage_lend_end();
         if (self.dcache_tail_pos.len > 0) {
             // decode at sim_pos (+ iterations); the memset below also clears the tail slots: re-upload the usable ones
             self.reset_decode_cache_session(@as(u32, @intCast(sim_pos)) + iterations + 8);

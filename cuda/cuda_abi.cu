@@ -1105,6 +1105,11 @@ void squid_prefill_tiles_set_host_banks(int32_t banks_host) {
     prefill_tiles_set_host_banks(banks_host);
 }
 
+int32_t squid_prefill_stage_borrow(const uint64_t* ptrs, const uint64_t* sizes, int32_t n, int32_t b, void* stream) {
+    return prefill_stage_borrow(ptrs, sizes, n, b, static_cast<cudaStream_t>(stream));
+}
+void squid_prefill_stage_return(void) { prefill_stage_return(); }
+
 uint64_t squid_prefill_stage_init(void) {
     return (uint64_t)prefill_stage_init();
 }

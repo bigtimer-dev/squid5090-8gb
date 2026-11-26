@@ -831,16 +831,22 @@ p_wgemm_kernel(
 // slots on its own stream, and the GEMM of each group reads them from there while the next group copies. Same
 // tiles, same arithmetic, so the output is bit-identical. SQUID_PREFILL_STAGE_MB = VRAM for the two slots (128;
 // less if fewer than 192 MiB would stay free; 0 = off: read host RAM directly); SQUID_PREFILL_STAGE_MIN_B =
-// smallest chunk that uses it (0: on a 4060 Laptop it was faster from the smallest batched chunk up).
-constexpr int PREFILL_STAGE_SLOTS = 2;
+// smallest chunk that uses it (0: on a 4060 Laptop it was faster from the smallest batched chunk up). During a
+// prefill the engine can lend it more slots (prefill_stage_borrow); the ring then holds slots of different sizes, each
+// group as many experts as its slot fits.
+constexpr int PREFILL_STAGE_SLOTS = 2;                     // its own slots
+constexpr int PREFILL_STAGE_MAX = PREFILL_STAGE_SLOTS + 64; // + VRAM borrowed for one prefill (prefill_stage_borrow)
 struct PrefillStage {
-    uint8_t* slot[PREFILL_STAGE_SLOTS] = {};
-    size_t slot_bytes = 0;
+    uint8_t* slot[PREFILL_STAGE_MAX] = {};
+    size_t sz[PREFILL_STAGE_MAX] = {};
+    int n = 0;              // slots in the ring: its own, then the borrowed ones
+    size_t slot_bytes = 0;  // size of its own slots (0: stage off)
     cudaStream_t copy = nullptr;
-    cudaEvent_t ready[PREFILL_STAGE_SLOTS] = {}, freed[PREFILL_STAGE_SLOTS] = {};
+    cudaEvent_t ready[PREFILL_STAGE_MAX] = {}, freed[PREFILL_STAGE_MAX] = {}, borrowed = nullptr;
     unsigned seq = 0;
     int sms = 0, min_b = 0;
 };
+constexpr size_t PREFILL_STAGE_NEED = (size_t)2304 * (1152 + 144) + 256; // one NVFP4 w13 expert
 static PrefillStage g_stage;
 static int g_prefill_banks_host = -1;
 
@@ -865,16 +871,18 @@ static void dispatch_wgemm_tm(
     const float* factors = (FMT == 0) ? eb.expert_scale : nullptr;
     PrefillStage& st = g_stage;
     const size_t pc = (size_t)NE * C::CODE_ROW, ps = (size_t)NE * C::SCALE_ROW;
-    const int G = (st.slot_bytes > 256) ? (int)((st.slot_bytes - 256) / (pc + ps)) : 0;
+    const size_t pe = pc + ps;
+    const int G = (st.slot_bytes > 256) ? (int)((st.slot_bytes - 256) / pe) : 0; // its own slots hold >= 1
     if (G >= 1 && B >= st.min_b && prefill_bank_on_host(eb.data)) {
-        for (int e_lo = 0; e_lo < NUM_EXPERTS; e_lo += G) {
-            const int e_hi = (e_lo + G < NUM_EXPERTS) ? e_lo + G : NUM_EXPERTS;
+        for (int e_lo = 0; e_lo < NUM_EXPERTS;) {
+            const unsigned k = st.seq++ % (unsigned)st.n;
+            const int gk = (int)((st.sz[k] - 256) / pe); // >= 1: borrowed slots are at least PREFILL_STAGE_NEED
+            const int e_hi = (e_lo + gk < NUM_EXPERTS) ? e_lo + gk : NUM_EXPERTS;
             const size_t ne = (size_t)(e_hi - e_lo);
             const uint8_t* gc = eb.data + e_lo * pc;   // the group in host RAM, read directly if a copy fails
             const uint8_t* gs = eb.scales + e_lo * ps;
-            const unsigned k = st.seq++ % PREFILL_STAGE_SLOTS;
             uint8_t* dc = st.slot[k];
-            uint8_t* ds = dc + ((G * pc + 255) & ~(size_t)255);
+            uint8_t* ds = dc + ((ne * pc + 255) & ~(size_t)255);
             if (st.slot_bytes > 0) {
                 const bool ok = cudaStreamWaitEvent(st.copy, st.freed[k], 0) == cudaSuccess && // the slot's last GEMM is done
                                 cudaMemcpyAsync(dc, gc, ne * pc, cudaMemcpyDefault, st.copy) == cudaSuccess &&
@@ -893,6 +901,7 @@ static void dispatch_wgemm_tm(
             p_wgemm_kernel<FMT, MODE, K, TM><<<st.sms, WG_NT, SMEM, stream>>>(
                 gc, gs, factors, x_h, expert_offsets, sorted_tok, sorted_slot, sorted_w, out_act_h, out_slots, e_lo, e_hi);
             if (gc == dc) cudaEventRecord(st.freed[k], stream);
+            e_lo = e_hi;
         }
         return;
     }
@@ -1558,8 +1567,7 @@ size_t prefill_stage_init() {
     const size_t keep = (size_t)192 << 20; // what stays free for the CUDA graphs, cuBLAS and the driver
     if (free_b < keep + want) want = (free_b > keep) ? free_b - keep : 0;
     const size_t slot = (want / PREFILL_STAGE_SLOTS) & ~(size_t)255;
-    const size_t need = (size_t)2304 * (1152 + 144) + 256; // one NVFP4 w13 expert; banks a slot can't hold read directly
-    if (slot < need) return 0;
+    if (slot < PREFILL_STAGE_NEED) return 0; // banks a slot can't hold (one NVFP4 w13 expert) read directly
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&g_stage.sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) return 0;
     if (cudaStreamCreateWithFlags(&g_stage.copy, cudaStreamNonBlocking) != cudaSuccess) return 0;
@@ -1572,8 +1580,47 @@ size_t prefill_stage_init() {
             return 0;
         }
     }
+    for (int k = PREFILL_STAGE_SLOTS; k < PREFILL_STAGE_MAX; ++k)
+        if (cudaEventCreateWithFlags(&g_stage.ready[k], cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&g_stage.freed[k], cudaEventDisableTiming) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+    if (cudaEventCreateWithFlags(&g_stage.borrowed, cudaEventDisableTiming) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+    for (int k = 0; k < PREFILL_STAGE_SLOTS; ++k) g_stage.sz[k] = slot;
+    g_stage.n = PREFILL_STAGE_SLOTS;
     g_stage.slot_bytes = slot;
     return slot * PREFILL_STAGE_SLOTS;
+}
+
+// Lends the stage more VRAM for one prefill: regions [ptr, ptr + size), cut into slots no bigger than its own, that
+// the caller doesn't touch until prefill_stage_return (the engine lends the decode cache's KV-tail slots and re-uploads
+// them afterwards). Copies into them are queued after everything already on `stream`. With more slots the copy engine
+// runs further ahead: through attention and the VRAM-bank layers it fetches the next host layers' experts. Returns the
+// slots taken (0 for a batch below the stage's minimum, which reads host RAM directly).
+int prefill_stage_borrow(const uint64_t* ptrs, const uint64_t* sizes, int n, int b, cudaStream_t stream) {
+    if (g_stage.slot_bytes == 0 || b < g_stage.min_b) return 0;
+    int m = 0;
+    for (int i = 0; i < n; ++i) {
+        uint64_t a = (ptrs[i] + 255) & ~(uint64_t)255;
+        const uint64_t end = (ptrs[i] + sizes[i]) & ~(uint64_t)255;
+        while (end > a && end - a >= PREFILL_STAGE_NEED && PREFILL_STAGE_SLOTS + m < PREFILL_STAGE_MAX) {
+            uint64_t sz = end - a;
+            if (sz > g_stage.slot_bytes) sz = (sz - g_stage.slot_bytes >= PREFILL_STAGE_NEED) ? g_stage.slot_bytes : sz;
+            g_stage.slot[PREFILL_STAGE_SLOTS + m] = reinterpret_cast<uint8_t*>(a);
+            g_stage.sz[PREFILL_STAGE_SLOTS + m] = sz;
+            a += sz;
+            ++m;
+        }
+    }
+    if (m == 0) return 0;
+    if (cudaEventRecord(g_stage.borrowed, stream) != cudaSuccess ||
+        cudaStreamWaitEvent(g_stage.copy, g_stage.borrowed, 0) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+    g_stage.n = PREFILL_STAGE_SLOTS + m;
+    return m;
+}
+
+// Ends the loan: later groups use only the stage's own slots. Work already queued on the stream still reads the
+// borrowed regions, so the caller orders its next writes to them on that stream.
+void prefill_stage_return() {
+    g_stage.n = PREFILL_STAGE_SLOTS;
 }
 
 static int prefill_tile_rows(int B) {

@@ -8,6 +8,7 @@
 - **Speculative drafting works with CPU + GPU experts** (`--mtp 7`, see [Drafting](#drafting-on-the-cpu--gpu-path)): ~67 tok/s on a short prompt instead of 54–55, and 74 instead of 48 tok/s over replayed OpenCode requests. The built-in DSpark drafter proposes 7 tokens and one target pass checks 1, 3 or 7 of them, depending on the drafter's confidence. In that pass the CPU computes the RAM experts of all the tokens in one request, and the GPU reads each cached expert once for all of them. Prompts take ~10% longer with the drafter on.
 - **Prompts of up to ~80 tokens are read 1.7–2.9× faster with CPU + GPU experts** (see [Reading prompts](#reading-prompts-on-the-cpu--gpu-path)): the last ≤ 160 tokens of a prompt go through the generation path instead of a batched chunk that streams the host experts over PCIe. A 41-token prompt takes 0.50 s instead of 1.22 s. Prefill chunks also use 128-token tiles at every size when experts live in host RAM, which reads them fewer times: a 500-token prompt takes 2.2 s instead of 3.3, and 2.0 s instead of 2.9 with GPU experts. Replayed OpenCode requests spend 18% less time reading prompts.
 - **Prompts longer than 160 tokens are read 1.3–1.8× faster when experts live in host RAM** (see [Reading prompts](#reading-prompts-on-the-cpu--gpu-path)). Prefill now copies the host experts into VRAM with the copy engine, a group at a time, and multiplies them there. Before, each 128-token tile read its experts over PCIe again. With CPU + GPU experts and `--mtp 7`, a 32K-token prompt takes 37.7 s instead of 66.9 s, and a 500-token prompt 1.44 s instead of 2.17 s. With GPU experts, a 12.6K-token prompt takes 15.3 s instead of 24.5 s. The output is bit-identical. Replayed OpenCode requests spend 35% less time reading prompts.
+- **Prompts longer than 160 tokens are read another 9–14% faster with CPU + GPU experts** (see [Reading prompts](#reading-prompts-on-the-cpu--gpu-path)). While a prompt is read, the expert stage also borrows the decode cache's KV-tail slots, up to 957 MiB, so the copy engine can fetch the next host layers' experts during attention and the VRAM layers. With `--mtp 7`, a 12.6K-token prompt takes 13.0 s instead of 15.1 s, and a 32K-token prompt 33.0 s instead of 37.5 s. The output is bit-identical. Replayed OpenCode requests spend 11% less time reading prompts.
 - **Image input.** Chat requests can carry images in user and tool messages: OpenAI-style `image_url` parts with base64 `data:` URLs, in PNG, JPEG or WebP. Inkling-2-Mini's vision encoder runs on the GPU inside the prefill buffers. Its 609 MiB of weights stay in pinned host RAM and stream over PCIe one layer at a time, so it takes no VRAM and the context stays at 64K. See [Images](#images).
 - **Experts that don't fit in VRAM are read from host RAM.** Upstream keeps every weight in VRAM (15.6 GiB at 8K context). Here, the expert banks beyond the VRAM budget go into one mapped, pinned host buffer that the GPU reads zero-copy over PCIe. VRAM goes to the looped core layers first, because layers 6–17 run three times per token. If everything fits, nothing moves.
 - **`--uncensor PATH` applies the [AtomicChat uncensored LoRA](https://huggingface.co/AtomicChat/Inkling-2-Mini-Uncensored-GGUF) exactly.** That rank-1 LoRA is a projection removal, `y -= b·(b·y)`, on the attention output and on every expert's down projection, plus an edit to the embedding table. A new kernel applies the projection before the short conv. Upstream's `--ablation` hook runs after the conv, so it can't reproduce the LoRA. [`tools/uncensor-lora/`](tools/uncensor-lora/) checks the equivalence on the real weights and bakes the embedding edit into a reflinked copy of the checkpoint.
@@ -51,7 +52,7 @@ How one generated token runs at 64K context with fp8 KV on the 8 GB card:
   - Meanwhile the CPU computes the rest straight from RAM: 8 threads pinned to CPUs 0–7, AVX-512 VNNI on int16 activations, with work stealing. The GPU then adds the CPU's partial sum.
 - **The decode cache lives in VRAM that sits idle while one sequence generates:**
   - The prefill buffers hold 169 experts (722 MiB) on this card.
-  - The unused ends of the 16 global-layer KV arrays hold up to 224 more (957 MiB, `SQUID_DECODE_CACHE_TAIL`). In a conversation shorter than the context limit, most of each array is empty. A slot is switched off before the conversation reaches it: 224 are usable on a short prompt, 192 at 12.6K tokens, 112 at 32K and none past ~61K.
+  - The unused ends of the 16 global-layer KV arrays hold up to 224 more (957 MiB, `SQUID_DECODE_CACHE_TAIL`). In a conversation shorter than the context limit, most of each array is empty. A slot is switched off before the conversation reaches it: 224 are usable on a short prompt, 192 at 12.6K tokens, 112 at 32K and none past ~61K. While a prompt is read, the prefill expert stage borrows the usable ones (see [Reading prompts](#reading-prompts-on-the-cpu--gpu-path)).
   - The 300 least-used experts of the 9 VRAM layers (4% of those layers' routing, by the prior) are handed to the CPU, which computes them from pinned RAM copies (1.28 GiB, `SQUID_DECODE_CACHE_DEMOTE`). Their VRAM holds 300 more host experts while a sequence generates. Prefill needs every expert on the GPU, so they are copied back after each answer and their slots are refilled for the next one (in the background with `SQUID_DECODE_CACHE_LAZY=1`).
   - Each request starts from the experts that a routing prior ranks highest ([`tools/decode-cache/`](tools/decode-cache/)).
   - Every 16 tokens, up to 16 cached experts are swapped for ones this request uses more.
@@ -85,10 +86,11 @@ Prompts take ~10% longer because the drafter also runs over every prompt token t
 
 ### Reading prompts on the CPU + GPU path
 
-Upstream reads a prompt in batched chunks and ends with passes of up to 8 tokens. With experts in host RAM, both read those experts over PCIe: a chunk reads every host expert its tokens route to, which costs ~1.1 s even for 32 tokens, and an 8-token pass reads its tokens' experts in ~250 ms. Three changes:
+Upstream reads a prompt in batched chunks and ends with passes of up to 8 tokens. With experts in host RAM, both read those experts over PCIe: a chunk reads every host expert its tokens route to, which costs ~1.1 s even for 32 tokens, and an 8-token pass reads its tokens' experts in ~250 ms. Four changes:
 - **The last ≤ 160 tokens of a prompt run on the generation path,** 8 per pass, like the passes that check drafts: the CPU computes the RAM experts and the GPU computes the cached ones, in ~75 ms per pass. The decode cache is set up first, so its background refill runs while the prompt is read, and the first tokens of the reply come faster too. Longer prompts are still chunked, down to their last ≤ 8 tokens. 160 is about the break-even point on this machine (`SQUID_PREFILL_CPU_MAX`; `0` restores upstream).
 - **Prefill chunks use 128-token tiles at every size** when any expert bank is in host RAM. Upstream uses 32-token tiles for chunks of up to 512 tokens. Each tile reads its experts' weights, so with small tiles a 500-token chunk read the host experts several times and took longer than an 800-token chunk. The output is bit-identical (`SQUID_PREFILL_TM32_MAX`). This also applies with GPU experts. When every bank fits in VRAM, upstream's tiles are kept.
 - **Prefill copies the host experts into VRAM before multiplying them.** A chunk's expert GEMMs read each host expert from RAM once per 128-token tile that routes to it, in 64-byte pieces, and the GPU's L2 cache doesn't keep those reads. A 2048-token chunk got ~5 GB/s of weights out of a link that does 13.3. Now the copy engine copies up to 22 experts at a time into one of two VRAM slots, on its own stream. The GEMM for that group reads them from VRAM while the next group is copied. The tiles and their arithmetic don't change, so the output is bit-identical. This also applies with GPU experts. The slots take 128 MiB of VRAM that was free (free after init: 338 → 210 MiB). They get less if fewer than 192 MiB would stay free. With GPU experts, whose banks fill VRAM, they get 16 MiB, which still gives most of the gain (`SQUID_PREFILL_STAGE_MB`; `0` reads host RAM directly).
+- **While a prompt is read, the stage borrows the decode cache's KV-tail slots.** With its two slots, the copy engine could only run 128 MiB ahead of the GEMMs, less than a quarter of a host layer's experts. It sat idle through attention and through the VRAM-bank layers 6–13, ~0.3 s per loop pass. Then the next host layer waited for its copies: ~0.5 s of a 2048-token chunk's ~2.1 s. The usable tail slots lie past the prompt, so the prompt never touches them. For as long as the prompt is read they become more stage slots: 957 MiB on a short prompt, 820 MiB at 12.6K tokens, 480 MiB at 32K and none past ~61K. The decode cache then copies its experts back into them before the reply, in the background with `SQUID_DECODE_CACHE_LAZY=1`. The output is bit-identical. With GPU experts there is no decode cache, so nothing changes (`SQUID_PREFILL_STAGE_LEND`; `0` = off).
 
 The first two changes, measured with the settings above and `--mtp 7` against the build before them, run before and after (median of 3 runs, 32-token replies):
 
@@ -124,6 +126,24 @@ The expert stage, measured the same way against the build before it, run before 
 | 42 replayed OpenCode requests: prompt reading, total | 150.3 / 150.3 s | **97.2 s** |
 
 Prompts of up to 160 tokens take the generation path, so they don't change. Generation speed doesn't change either: 100.0 / 100.4 → 100.0 tok/s after the 12.6K-token prompt, 79.6 / 81.4 → 80.0 tok/s over the OpenCode replay. With GPU experts (`--mtp 0`), 500 tokens go from 2.03 / 2.01 to 1.47 s, 12.6K tokens from 24.5 / 24.5 to 15.3 s, and 32K tokens from 61.0 to 38.1 s ¹. Greedy output matched the build before it on 201-, 800-, 1.5K- and 12.6K-token prompts at `--mtp 0` and `--mtp 7`, and with GPU experts. Tool calls, the needle tests at 32K and 62K, the KV-tail and hole checks, and image input pass. ¹ The new build with `SQUID_PREFILL_STAGE_MB=0`, which reads prompts as fast as the build before it.
+
+Borrowing the tail slots, measured the same way against the build before it, run before and after (refill in the background; median of 3 runs up to 3K tokens and at 12.6K, one run each at 32K):
+
+| Prompt | Before | Now |
+|---|---:|---:|
+| 41 tokens | 0.49 / 0.49 s | 0.49 s |
+| 130 tokens | 1.28 / 1.27 s | 1.28 s |
+| 201 tokens | 1.29 / 1.28 s | **1.17 s** |
+| 300 tokens | 1.35 / 1.35 s | **1.20 s** |
+| 500 tokens | 1.44 / 1.44 s | **1.28 s** |
+| 800 tokens | 1.61 / 1.63 s | **1.45 s** |
+| 1.5K tokens | 2.02 / 2.03 s | **1.79 s** |
+| 3K tokens | 3.82 / 3.83 s | **3.33 s** |
+| 12.6K tokens | 15.06 / 15.05 s | **12.98 s** |
+| 32K tokens | 37.5 / 37.6 / 37.6 s | **33.0 / 33.0 s** |
+| 42 replayed OpenCode requests: prompt reading, total | 97.1 / 97.2 s | **86.7 s** |
+
+Prompts of up to 160 tokens take the generation path, so they don't change. Generation is as fast as before. With the refill in the foreground (`SQUID_DECODE_CACHE_LAZY` off) the text stays the same, and after the 12.6K-token prompt it runs at 104.5 → 104.5 tok/s with `--mtp 7` and 47.1 → 47.2 tok/s with `--mtp 0`. With the refill in the background, the first tokens of a reply compute the borrowed slots' experts on the CPU until they are back. That changes timing, and with it the text: 99.8 / 100.0 → 94.8 tok/s after the 12.6K-token prompt, because fewer drafts were accepted (6.38 instead of 6.89 tokens per pass; the passes themselves ran at 14.9 instead of 14.5 per second). Over the OpenCode replay it is 81.1 / 81.1 → 80.1 tok/s. Greedy output matched the build before it on 201-, 800-, 1.5K- and 12.6K-token prompts at `--mtp 0` and `--mtp 7`, with the refill in the foreground. Tool calls, the needle tests at 32K and 62K, the KV-tail and hole checks, and image input pass.
 
 Over a 256-token reply to a 25-token code prompt the gain in generation is gone: 66.4 tok/s against 67.4 and 67.3. The prompt is computed differently, so the reply's text changes, and with it the share of accepted drafts (59.1% instead of 61.5%).
 
@@ -174,8 +194,8 @@ Both engines got the same prompts: 64K context, 8-bit KV cache, the uncensored m
 | Generation after 46K tokens of context | — | 11.7 tok/s | — |
 | Generation after 64K tokens of context | — | — | **37.1 tok/s** |
 | Reading a 3.8K-token prompt † | 76 tok/s (51 s) | **509 tok/s (7.5 s)** | same path |
-| Reading a 12.6K-token prompt | 70 tok/s (181 s) | **824 tok/s (15.3 s)** | **837 tok/s (15.1 s)** ‡ |
-| Reading a 32K-token prompt | — | **835 tok/s (38.1 s)** | **843 tok/s (37.7 s)** ‡ |
+| Reading a 12.6K-token prompt | 70 tok/s (181 s) | **824 tok/s (15.3 s)** | **971 tok/s (13.0 s)** ‡ |
+| Reading a 32K-token prompt | — | **835 tok/s (38.1 s)** | **964 tok/s (33.0 s)** ‡ |
 | Reading a 46K-token prompt † | — | **500 tok/s (93 s)** | same path |
 | Reading a 64K-token prompt | — | — | **773 tok/s (82.3 s)** ‡ |
 
@@ -229,6 +249,7 @@ Only `--mode nvfp4` has been tested with the offload.
 | `SQUID_PREFILL_TM32_MAX` | `0` with host banks, else `512` | Prefill chunks of at most this many tokens use 32-token tiles in the expert GEMMs, larger ones 128 (bit-identical; at most 512) |
 | `SQUID_PREFILL_STAGE_MB` | `128` | VRAM for the two slots that prefill copies host-RAM experts into, a group at a time (less if fewer than 192 MiB would stay free; bit-identical); `0` = the expert GEMMs read host RAM directly |
 | `SQUID_PREFILL_STAGE_MIN_B` | `0` | Smallest prefill chunk that uses the stage |
+| `SQUID_PREFILL_STAGE_LEND` | `1` | While a prompt is read, the stage also copies into the decode cache's usable KV-tail slots (`SQUID_DECODE_CACHE_TAIL`), which the decode cache refills before the reply (bit-identical); `0` = off |
 | `SQUID_LOCAL_KV` | `bf16` | `fp8` = K/V of the 40 sliding-window visits as fp8 E4M3 with a per-(token, head) scale: generation +1.9% at 12.6K and +1.5% at 32K. **Lossy**: teacher-forced NLL vs the GPU-only path −0.0048 ± 0.0043 and +0.0067 ± 0.0026 nats (default −0.0039 and +0.0018), top token 995/1024 and 251/256, so it is off by default |
 | `SQUID_VISION` | `1` | `0` = no image input (requests with images get an error) |
 | `SQUID_IMAGE_MAX_TOKENS` | `1600` | Prompt tokens per image; larger images are downscaled |
